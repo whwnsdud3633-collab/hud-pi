@@ -187,7 +187,8 @@ class HudRenderer:
     def _road_points(self, lane: Any) -> tuple[np.ndarray, np.ndarray]:
         """노면 위 차선 좌표를 패널 픽셀로. 지평선 위쪽은 버린다."""
         clipped = self.mapper.clip_above_horizon(lane)
-        return self.mapper.project(clipped)
+        points, _depths, valid = self.mapper.project(clipped)
+        return points, valid
 
     def _panel_point(self, x: float, y: float) -> tuple[int, int]:
         """화면 고정 요소용. 안전 영역 안의 비율 좌표를 픽셀로 옮긴다."""

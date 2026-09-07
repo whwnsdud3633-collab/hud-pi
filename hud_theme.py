@@ -285,7 +285,10 @@ class ThemeRenderer:
 
     def _project_lane(self, lane: Any) -> np.ndarray | None:
         clipped = self.mapper.clip_above_horizon(lane)
-        points, valid = self.mapper.project(clipped)
+        # depths 는 아직 리본 그리기까지 전달되지 않는다. 깊이 가중 눈높이
+        # 보정은 hud_align 안에서 이미 끝나 있어 화면은 맞지만, 틱 배치를
+        # 실제 거리로 잡으려면 아래 필터·정렬을 depths 에도 걸어야 한다.
+        points, depths, valid = self.mapper.project(clipped)
         if valid.sum() < 2:
             return None
         points = points[valid]
