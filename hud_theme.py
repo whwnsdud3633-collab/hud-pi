@@ -7,6 +7,7 @@
 
   - 원근 페이드: 마스크를 그린 뒤 세로 방향 알파 램프를 곱한다
   - 합성: 발광 디스플레이라 알파가 아니라 가산으로 쌓는다
+  - 선 굵기: 절대 픽셀이 아니라 화면 높이 비율 (theme.*_width_ratio)
 
 차선 폴리라인은 추론이 보낸 정규화 좌표를 운전자 시점 정렬 행렬로 투영해서
 그린다.
@@ -26,7 +27,6 @@ DESIGN_W, DESIGN_H = 960.0, 540.0
 HORIZON_Y = 172.0
 
 ALERT = (61, 77, 255)        # #ff4d3d BGR
-ACCENT = (232, 214, 79)      # #4fd6e8 BGR
 WHITE = (255, 255, 255)
 
 EDGE_STOPS = ((0.0, 1.0), (0.62, 0.72), (1.0, 0.0))
@@ -57,14 +57,19 @@ class ThemeRenderer:
         self.mapper = AlignmentMap(config)
 
         theme = config.setdefault("theme", {})
-        theme.setdefault("edge_width", 4.0)
-        theme.setdefault("alert_edge_width", 8.0)
+        # 굵기는 절대 픽셀이 아니라 화면 높이 비율로 둔다. 패널이 바뀌어도
+        # 눈에 보이는 굵기가 유지된다. 1280x720 에서 0.0148 -> 약 11px.
+        theme.setdefault("edge_width_ratio", 0.0148)
+        theme.setdefault("alert_edge_width_ratio", 0.0296)
+        theme.setdefault("dim_edge_width_ratio", 0.0111)
         theme.setdefault("boot_animation", True)
         self.theme = theme
         # hud_ui 의 preview / sample 과 인터페이스를 맞추기 위한 최소 항목
         self.ui = config.setdefault("ui", {})
         self.ui.setdefault("debug", {"enabled": False})
-        self.ui.setdefault("lane", {"thickness": int(theme["edge_width"])})
+        self.ui.setdefault(
+            "lane", {"thickness": self._ratio_px(theme["edge_width_ratio"])}
+        )
 
         # 디자인 960x540 을 패널에 레터박스로 맞춘다
         self.scale = min(self.width / DESIGN_W, self.height / DESIGN_H)
@@ -107,8 +112,9 @@ class ThemeRenderer:
     def _dp(self, x: float, y: float) -> tuple[int, int]:
         return int(round(self._dx(x))), int(round(self._dy(y)))
 
-    def _dw(self, value: float) -> int:
-        return max(1, int(round(value * self.scale)))
+    def _ratio_px(self, ratio: float) -> int:
+        """화면 높이 비율을 선 굵기 픽셀로 바꾼다."""
+        return max(1, int(round(float(ratio) * self.height)))
 
     # 합성 --------------------------------------------------------------
 
@@ -192,22 +198,25 @@ class ThemeRenderer:
                     continue
             mask = self._clear_mask()
             departing = alert and side == departure_side
-            width = self.theme["alert_edge_width"] if departing else self.theme["edge_width"]
-            if alert and not departing:
-                width = 3.0
+            if departing:
+                width = self._ratio_px(self.theme["alert_edge_width_ratio"])
+            elif alert:
+                width = self._ratio_px(self.theme["dim_edge_width_ratio"])
+            else:
+                width = self._ratio_px(self.theme["edge_width_ratio"])
             if low_confidence:
                 for index in range(0, len(reveal) - 1, 2):
                     cv2.line(mask, tuple(reveal[index]), tuple(reveal[index + 1]),
-                             255, self._dw(width), cv2.LINE_AA)
+                             255, width, cv2.LINE_AA)
             else:
-                cv2.polylines(mask, [reveal], False, 255, self._dw(width), cv2.LINE_AA)
+                cv2.polylines(mask, [reveal], False, 255, width, cv2.LINE_AA)
             if departing:
                 on = phase < 0.5                     # steps(1, end)
                 self._paint(mask, ALERT, "alert_edge", 1.0 if on else 0.18)
             elif alert:
                 self._paint(mask, WHITE, "dim")
             else:
-                self._paint(mask, ACCENT, "edge", dim_factor)
+                self._paint(mask, WHITE, "edge", dim_factor)
 
     # 출력 --------------------------------------------------------------
 

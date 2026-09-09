@@ -51,5 +51,11 @@
   },
   "ui": {
     "style": "ar_overlay"
+  },
+  "theme": {
+    "edge_width_ratio": 0.0148,
+    "alert_edge_width_ratio": 0.0296,
+    "dim_edge_width_ratio": 0.0111,
+    "boot_animation": true
   }
 }
