@@ -26,6 +26,8 @@ import cv2
 import numpy as np
 
 from hud_align import AlignmentMap, ensure_alignment_config
+# 인식 상태 정의는 렌더러 쪽 한 곳(hud_theme)에만 둔다
+from hud_theme import LANE_STATES, ThemeRenderer, normalize_state
 from hud_system import (
     PacketError,
     _decode_packet,
@@ -44,20 +46,6 @@ WARNING_STATES = (
     "change_left",
     "change_right",
 )
-
-# 젯슨이 보내는 인식 상태. 0 정상, 1 주의(차선이 흐릿함), 2 인식 불가.
-# 프로토콜 합의 전이라 패킷에 없을 수 있고, 그때는 0 으로 본다.
-LANE_STATES = (0, 1, 2)
-
-
-def normalize_state(value: Any) -> int:
-    """패킷에서 읽은 state 를 0/1/2 로 만든다. 이상하면 0."""
-    try:
-        state = int(value)
-    except (TypeError, ValueError):
-        return 0
-    return state if state in LANE_STATES else 0
-
 
 DEFAULT_UI: dict[str, Any] = {
     "safe_area": [0.06, 0.06, 0.94, 0.94],
@@ -429,7 +417,6 @@ class HudRenderer:
 def make_renderer(config: dict[str, Any], theme: bool):
     """시안 테마와 기본 선 표시 중 하나를 고른다."""
     if theme or str(config.get("ui", {}).get("style", "")) == "ar_overlay":
-        from hud_theme import ThemeRenderer
         return ThemeRenderer(config)
     return HudRenderer(config)
 

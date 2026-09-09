@@ -13,7 +13,7 @@
 그린다.
 
 인식 상태 state(0 정상 / 1 주의 / 2 인식 불가)는 render() 로 받아 self.state 에
-보관만 한다. 신호등과 차선 스타일에 반영하는 것은 다음 단계다.
+보관만 한다. 화면에 표시하는 것은 다음 단계다.
 """
 
 from __future__ import annotations
@@ -38,9 +38,19 @@ ALERT_EDGE_STOPS = ((0.0, 1.0), (0.62, 0.70), (1.0, 0.0))
 
 BLINK_PERIOD = 0.820
 
-# 인식 상태. 0 정상, 1 주의(차선이 흐릿함), 2 인식 불가
+# 인식 상태. 0 정상, 1 주의(차선이 흐릿함), 2 인식 불가.
+# 젯슨이 패킷에 실어 보낸다. 프로토콜 합의 전이라 빠져 있을 수 있고
+# 그때는 0 으로 본다. hud_ui 도 이 정의를 가져다 쓴다.
 STATE_NORMAL, STATE_CAUTION, STATE_LOST = 0, 1, 2
 LANE_STATES = (STATE_NORMAL, STATE_CAUTION, STATE_LOST)
+
+def normalize_state(value: Any) -> int:
+    """패킷에서 읽은 state 를 0/1/2 로 만든다. 이상하면 0."""
+    try:
+        state = int(value)
+    except (TypeError, ValueError):
+        return STATE_NORMAL
+    return state if state in LANE_STATES else STATE_NORMAL
 
 
 def _build_ramp(height: int, bottom_y: float, top_y: float, stops) -> np.ndarray:
@@ -245,8 +255,7 @@ class ThemeRenderer:
         state: int = STATE_NORMAL,
     ) -> np.ndarray:
         telemetry = telemetry or {}
-        # 지금은 받아서 보관만 한다
-        self.state = state if state in LANE_STATES else STATE_NORMAL
+        self.state = normalize_state(state)
         for plane in self.planes:
             plane[:] = 0.0
 
