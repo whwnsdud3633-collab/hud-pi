@@ -1,280 +1,552 @@
 #!/usr/bin/env python3
-"""HUD 상태 계층. 설정, 차선 선택, 시간축 스무딩, 패킷 입출력.
+"""차선 좌표를 UDP로 받아 HUD에 흰색 연속선으로 표시하는 독립 실행 코드.
 
-렌더러(hud_theme / hud_ui)와 배선(hud_proto) 사이에 있다. 화면에 무엇을
-그릴지는 모르고, 바이트를 어떻게 눕히는지도 모른다. 그 사이의 판단만 한다.
-
-패킷 스키마는 전부 hud_proto 에 있다. 이 파일은 그걸 호출하기만 한다.
-스키마를 여기서 다시 해석하지 말 것. 두 곳이 갈라지면 젯슨 쪽과 조용히
-어긋난다.
+이 파일에는 YOLO 추론이나 학습 코드가 포함되지 않는다. 기존 차선 추론
+파이프라인에서 HudSender를 import하여 최종 차선 폴리라인 좌표만 보내면 된다.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
+import select
+import socket
+import time
 from pathlib import Path
-from typing import Any
-
-import numpy as np
-
-from hud_align import ensure_alignment_config
-from hud_proto import DEPTHS, POINT_COUNT, PacketError, decode
-
-__all__ = [
-    "PacketError",
-    "LaneSmoother",
-    "load_config",
-    "save_config",
-    "DEFAULT_CONFIG",
-]
+from typing import Any, Iterable
 
 
-# ---------------------------------------------------------------------------
-# 설정
-# ---------------------------------------------------------------------------
-
+PROTOCOL_VERSION = 1
+MAX_DATAGRAM_BYTES = 60_000
 DEFAULT_CONFIG: dict[str, Any] = {
+    "network": {
+        "bind_host": "0.0.0.0",
+        "port": 5005,
+        "packet_timeout_seconds": 0.35,
+    },
     "display": {
         "width": 1280,
         "height": 720,
         "fullscreen": True,
-        "window_name": "AR HUD",
-        # 패널 → 반사판 → 눈 경로에서 상이 뒤집힌다. 실차 장착 후 켠다.
-        # 적용은 hud_align.AlignmentMap.project 가 한다.
+        "window_name": "Rain Lane HUD",
+        "line_thickness": 8,
+        "line_color_bgr": [255, 255, 255],
         "flip_horizontal": False,
-        # 시간축 스무딩. 1.0 이면 스무딩 없음, 낮을수록 무겁게 따라간다.
+        "flip_vertical": False,
+        "show_status": False,
         "smoothing_alpha": 0.55,
-        # 프레임 간 같은 차선으로 볼 근거리 x 차이(정규화).
         "association_distance": 0.18,
     },
-    "network": {
-        # 젯슨 직결 이더넷과 개발용 핫스팟 양쪽에서 받는다.
-        "bind_host": "0.0.0.0",
-        "port": 5005,
-        # 이 시간 동안 새 패킷이 없으면 차선을 지운다.
-        "packet_timeout_seconds": 0.5,
-    },
+    "destination_quad_normalized": [
+        [0.08, 0.08],
+        [0.92, 0.08],
+        [0.98, 0.98],
+        [0.02, 0.98],
+    ],
 }
 
 
-def _merge_defaults(target: dict[str, Any], defaults: dict[str, Any]) -> None:
-    """빠진 키만 채운다. 사용자가 적어 둔 값은 건드리지 않는다."""
-    for key, value in defaults.items():
-        if isinstance(value, dict):
-            _merge_defaults(target.setdefault(key, {}), value)
-        else:
-            target.setdefault(key, value)
+class PacketError(ValueError):
+    """잘못된 HUD 좌표 패킷."""
 
 
-def load_config(path: str | Path) -> dict[str, Any]:
-    """설정을 읽고 빠진 항목을 기본값으로 채운다.
-
-    파일이 없어도 기본값으로 동작한다. 파일을 만들지는 않는다. 저장은
-    preview 의 S 키나 hud_align 의 보정 도구가 명시적으로 한다.
-    """
-    config: dict[str, Any] = {}
-    file_path = Path(path)
-    if file_path.exists():
-        try:
-            with file_path.open("r", encoding="utf-8") as handle:
-                loaded = json.load(handle)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"{file_path}: JSON 을 읽을 수 없다 — {exc.msg}") from exc
-        if not isinstance(loaded, dict):
-            raise ValueError(f"{file_path}: 최상위가 오브젝트가 아니다")
-        config = loaded
-    _merge_defaults(config, DEFAULT_CONFIG)
-    # alignment 기본값까지 채워 둬야 저장했을 때 보정 항목이 파일에 남는다.
-    ensure_alignment_config(config)
-    return config
+def write_default_config(path: Path, *, overwrite: bool = False) -> None:
+    if path.exists() and not overwrite:
+        print(f"config already exists: {path}")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"config created: {path}")
 
 
-def save_config(path: str | Path, config: dict[str, Any]) -> None:
-    """설정을 저장한다. 쓰다 죽어도 원본이 남도록 임시 파일에 쓰고 바꿔친다."""
-    file_path = Path(path)
-    temporary = file_path.with_suffix(file_path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(config, handle, ensure_ascii=False, indent=2, sort_keys=False)
-        handle.write("\n")
-    temporary.replace(file_path)
+def load_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        write_default_config(path)
+    with path.open("r", encoding="utf-8") as stream:
+        return json.load(stream)
 
 
-# ---------------------------------------------------------------------------
-# 패킷
-# ---------------------------------------------------------------------------
+def save_config(path: Path, config: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
-def _decode_packet(data: bytes) -> dict[str, Any]:
-    """UDP 바이트 → 프레임 dict.
-
-    파싱은 전부 hud_proto.decode 가 한다. 여기서 필드를 다시 해석하지 말 것.
-    """
-    return decode(data)
-
-
-# ---------------------------------------------------------------------------
-# 차선 선택
-# ---------------------------------------------------------------------------
+def _finite(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
-def _near_x(lane: Any) -> float:
-    """차선의 근거리 쪽 x. 점 순서에 상관없이 y 가 가장 큰 점을 쓴다.
-
-    규약은 근거리 → 원거리지만, 추론 쪽이 뒤집어 보내도 선택이 흔들리지
-    않도록 방향에 의존하지 않는 방식으로 고른다.
-    """
-    array = np.asarray(lane, dtype=np.float32)
-    if array.ndim != 2 or array.shape[0] == 0:
-        return float("nan")
-    return float(array[int(np.argmax(array[:, 1])), 0])
-
-
-def _select_hud_lanes(lanes: Any, *, lane_change: bool = False) -> list[Any]:
-    """자차가 달리고 있는 차로의 좌/우 차선을 고른다.
-
-    화면 중앙(x=0.5)을 자차 위치로 보고, 왼쪽에서 가장 가까운 하나와
-    오른쪽에서 가장 가까운 하나를 집는다. 3차선 도로에서 바깥 차선까지
-    다 그리면 반사식 HUD 에서는 밝은 선이 늘어나 시야만 어지럽다.
-
-    차선 변경 중에는 넘어가는 쪽 차선이 중앙을 가로지르므로 좌/우 구분이
-    무너진다. 이때는 중앙에서 가까운 순으로 3개까지 남겨 전환을 보여 준다.
-    """
-    if not lanes:
-        return []
-
-    scored = []
-    for lane in lanes:
-        if lane is None or len(lane) < 2:
+def _sanitize_lane(lane: Iterable[Iterable[float]], max_points: int = 48) -> list[list[float]]:
+    points: list[list[float]] = []
+    for raw_point in lane:
+        point = list(raw_point)
+        if len(point) != 2 or not _finite(point[0]) or not _finite(point[1]):
             continue
-        x = _near_x(lane)
-        if math.isnan(x):
-            continue
-        scored.append((x, lane))
-    if not scored:
+        x = min(1.0, max(0.0, float(point[0])))
+        y = min(1.0, max(0.0, float(point[1])))
+        points.append([x, y])
+    points.sort(key=lambda item: item[1])
+    if len(points) > max_points:
+        indices = [round(i * (len(points) - 1) / (max_points - 1)) for i in range(max_points)]
+        points = [points[index] for index in indices]
+    if len(points) < 2:
         return []
+    return [[round(x, 5), round(y, 5)] for x, y in points]
 
+
+def _select_hud_lanes(
+    lanes: Iterable[Iterable[Iterable[float]]],
+    *,
+    lane_change: bool,
+) -> list[list[list[float]]]:
+    """평상시 2개, 차선 변경 시 최대 3개 차선을 선택한다."""
+    valid = [_sanitize_lane(lane) for lane in lanes]
+    valid = [lane for lane in valid if lane]
+    valid.sort(key=lambda lane: lane[-1][0])
+    limit = 3 if lane_change else 2
+    if len(valid) <= limit:
+        return valid
+
+    bottom_x = [lane[-1][0] for lane in valid]
     if lane_change:
-        scored.sort(key=lambda item: abs(item[0] - 0.5))
-        return [lane for _, lane in scored[:3]]
-
-    left = [item for item in scored if item[0] <= 0.5]
-    right = [item for item in scored if item[0] > 0.5]
-    selected = []
-    if left:
-        selected.append(max(left, key=lambda item: item[0]))
-    if right:
-        selected.append(min(right, key=lambda item: item[0]))
-    if not selected:
-        return []
-    # 한쪽에만 차선이 잡혔다면 중앙에서 가까운 두 개로 채운다.
-    if len(selected) == 1 and len(scored) >= 2:
-        scored.sort(key=lambda item: abs(item[0] - 0.5))
-        selected = scored[:2]
-    selected.sort(key=lambda item: item[0])
-    return [lane for _, lane in selected]
+        selected = sorted(
+            range(len(valid)),
+            key=lambda index: abs(bottom_x[index] - 0.5),
+        )[:3]
+    else:
+        left = [index for index, x in enumerate(bottom_x) if x <= 0.5]
+        right = [index for index, x in enumerate(bottom_x) if x > 0.5]
+        if left and right:
+            selected = [left[-1], right[0]]
+        else:
+            selected = sorted(
+                range(len(valid)),
+                key=lambda index: abs(bottom_x[index] - 0.5),
+            )[:2]
+    return [valid[index] for index in sorted(selected)]
 
 
-# ---------------------------------------------------------------------------
-# 시간축 스무딩
-# ---------------------------------------------------------------------------
+class HudSender:
+    """추론 코드에서 사용하는 HUD UDP 송신 어댑터."""
+
+    def __init__(self, host: str, port: int = 5005) -> None:
+        self.destination = (host, int(port))
+        self.sequence = 0
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def close(self) -> None:
+        self.socket.close()
+
+    def send_normalized(
+        self,
+        lanes: Iterable[Iterable[Iterable[float]]],
+        *,
+        lane_change: bool = False,
+        status: str | None = None,
+        fps: float = 0.0,
+        inference_ms: float = 0.0,
+    ) -> None:
+        selected = _select_hud_lanes(lanes, lane_change=lane_change)
+        if status is None:
+            if not selected:
+                status = "lost"
+            elif len(selected) < 2:
+                status = "degraded"
+            else:
+                status = "ok"
+        packet = {
+            "v": PROTOCOL_VERSION,
+            "seq": self.sequence,
+            "sent_at": time.time(),
+            "status": status,
+            "fps": round(float(fps), 2),
+            "inference_ms": round(float(inference_ms), 2),
+            "lane_change": bool(lane_change),
+            "lanes": selected,
+        }
+        payload = json.dumps(packet, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        if len(payload) > MAX_DATAGRAM_BYTES:
+            raise PacketError(f"packet too large: {len(payload)} bytes")
+        self.socket.sendto(payload, self.destination)
+        self.sequence += 1
+
+    def send_pixels(
+        self,
+        lanes: Iterable[Iterable[Iterable[float]]],
+        *,
+        frame_width: int,
+        frame_height: int,
+        lane_change: bool = False,
+        status: str | None = None,
+        fps: float = 0.0,
+        inference_ms: float = 0.0,
+    ) -> None:
+        width = max(1, int(frame_width) - 1)
+        height = max(1, int(frame_height) - 1)
+        normalized = [
+            [[float(x) / width, float(y) / height] for x, y in lane]
+            for lane in lanes
+        ]
+        self.send_normalized(
+            normalized,
+            lane_change=lane_change,
+            status=status,
+            fps=fps,
+            inference_ms=inference_ms,
+        )
+
+    def __enter__(self) -> "HudSender":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+def _decode_packet(payload: bytes) -> dict[str, Any]:
+    if len(payload) > MAX_DATAGRAM_BYTES:
+        raise PacketError("packet exceeds size limit")
+    try:
+        packet = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PacketError("invalid JSON") from exc
+    if not isinstance(packet, dict):
+        raise PacketError("packet must be an object")
+    if packet.get("v", PROTOCOL_VERSION) != PROTOCOL_VERSION:
+        raise PacketError("unsupported protocol version")
+    sequence = packet.get("seq")
+    if not isinstance(sequence, int) or sequence < 0:
+        raise PacketError("seq must be a non-negative integer")
+    status = packet.get("status", "ok")
+    if status not in {"ok", "degraded", "lost", "mock"}:
+        raise PacketError("unknown status")
+    lane_change = bool(packet.get("lane_change", False))
+    raw_lanes = packet.get("lanes", [])
+    if not isinstance(raw_lanes, list):
+        raise PacketError("lanes must be a list")
+    packet["lanes"] = _select_hud_lanes(raw_lanes, lane_change=lane_change)
+    packet["status"] = status
+    packet["lane_change"] = lane_change
+    packet["fps"] = float(packet.get("fps", 0.0))
+    packet["inference_ms"] = float(packet.get("inference_ms", 0.0))
+    return packet
 
 
 class LaneSmoother:
-    """차선을 프레임 사이에 이어 붙여 슬롯별로 지수 평활한다.
+    """아래쪽 x 위치로 차선을 대응시켜 HUD 흔들림을 줄인다."""
 
-    점 개수가 고정(POINT_COUNT)이라 i 번째 점은 항상 같은 거리를 뜻한다.
-    그래서 슬롯끼리 짝지어 필터를 걸 수 있다. 개수가 흔들리면 짝이 어긋나
-    오히려 떨림이 커지므로, 그런 프레임은 평활하지 않고 그대로 통과시킨다.
-    """
-
-    def __init__(self, alpha: float = 0.55, association_distance: float = 0.18) -> None:
-        # alpha 는 새 값을 얼마나 믿을지. 1.0 이면 스무딩 없음.
-        self.alpha = float(min(1.0, max(0.0, alpha)))
+    def __init__(self, alpha: float, association_distance: float) -> None:
+        self.alpha = float(alpha)
         self.association_distance = float(association_distance)
-        self._previous: list[np.ndarray] = []
+        self.previous: list[Any] = []
 
     def reset(self) -> None:
-        """송신기가 끊겼거나 재시작했다. 이어 붙일 과거를 버린다."""
-        self._previous = []
+        self.previous = []
 
-    def update(self, lanes: Any) -> list[list[list[float]]]:
-        """이번 프레임 차선을 받아 평활된 차선을 돌려준다."""
-        if not lanes:
-            self._previous = []
-            return []
+    def update(self, lanes: list[list[list[float]]]) -> list[list[list[float]]]:
+        import numpy as np
 
-        current: list[np.ndarray] = []
-        for lane in lanes:
-            array = np.asarray(lane, dtype=np.float32)
-            if array.ndim == 2 and array.shape[0] >= 2 and array.shape[1] >= 2:
-                current.append(np.ascontiguousarray(array[:, :2]))
-
-        smoothed: list[np.ndarray] = []
-        taken: set[int] = set()
-        for array in current:
-            index = self._associate(array, taken)
-            if index is None or self.alpha >= 1.0:
-                smoothed.append(array)
-                continue
-            taken.add(index)
-            previous = self._previous[index]
-            smoothed.append(previous + (array - previous) * self.alpha)
-
-        self._previous = smoothed
-        return [lane.tolist() for lane in smoothed]
-
-    def _associate(self, lane: np.ndarray, taken: set[int]) -> int | None:
-        """직전 프레임에서 같은 차선을 찾는다. 없으면 None (새 트랙)."""
-        best_index: int | None = None
-        best_distance = self.association_distance
-        near_x = _near_x(lane)
-        for index, previous in enumerate(self._previous):
-            if index in taken or previous.shape != lane.shape:
-                continue
-            distance = abs(_near_x(previous) - near_x)
-            if distance < best_distance:
-                best_index, best_distance = index, distance
-        return best_index
+        current = [np.asarray(lane, dtype=np.float32) for lane in lanes]
+        current.sort(key=lambda lane: float(lane[-1, 0]))
+        unused = set(range(len(self.previous)))
+        smoothed = []
+        for lane in current:
+            best_index = None
+            best_distance = float("inf")
+            for index in unused:
+                distance = abs(float(lane[-1, 0] - self.previous[index][-1, 0]))
+                if distance < best_distance:
+                    best_distance = distance
+                    best_index = index
+            if best_index is not None and best_distance <= self.association_distance:
+                previous = self.previous[best_index]
+                previous_x = np.interp(lane[:, 1], previous[:, 1], previous[:, 0])
+                lane[:, 0] = self.alpha * lane[:, 0] + (1.0 - self.alpha) * previous_x
+                unused.remove(best_index)
+            lane = np.clip(lane, 0.0, 1.0)
+            smoothed.append(lane)
+        self.previous = smoothed
+        return [np.round(lane, 5).tolist() for lane in smoothed]
 
 
-# ---------------------------------------------------------------------------
-# 목 데이터
-# ---------------------------------------------------------------------------
+def _build_homography(quad: list[list[float]], width: int, height: int) -> Any:
+    import cv2
+    import numpy as np
+
+    source = np.asarray([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32)
+    destination = np.asarray(quad, dtype=np.float32)
+    destination[:, 0] *= width - 1
+    destination[:, 1] *= height - 1
+    return cv2.getPerspectiveTransform(source, destination)
 
 
-def _mock_lane(
-    near_x: float,
-    far_x: float,
-    phase: float = 0.0,
+def _transform_lane(
+    lane: list[list[float]],
+    matrix: Any,
     *,
-    count: int = POINT_COUNT,
-    horizon: float = 0.40,
-) -> list[list[float]]:
-    """네트워크 없이 화면을 볼 때 쓰는 가짜 차선.
+    flip_horizontal: bool,
+    flip_vertical: bool,
+) -> Any:
+    import cv2
+    import numpy as np
 
-    점을 y 축에 균등하게 놓지 않는다. 젯슨은 고정 종방향 거리로 리샘플링해서
-    보내고, 원근에서 이미지 y 는 거리에 반비례하므로 (y = 지평선 + c/d) 실제
-    패킷은 원거리 쪽이 촘촘하다. 목 데이터도 같은 간격을 써야 스무딩과 깊이
-    가중 보정을 실제와 같은 조건에서 확인할 수 있다.
+    points = np.asarray(lane, dtype=np.float32)
+    if flip_horizontal:
+        points[:, 0] = 1.0 - points[:, 0]
+    if flip_vertical:
+        points[:, 1] = 1.0 - points[:, 1]
+    transformed = cv2.perspectiveTransform(points.reshape(1, -1, 2), matrix)[0]
+    return np.rint(transformed).astype(np.int32)
 
-    반환은 [[x, y], ...] 정규화 좌표, **근거리 → 원거리** 순. hud_proto.DEPTHS
-    의 슬롯 순서와 같아야 한다.
-    """
-    depths = np.asarray(DEPTHS, dtype=np.float32)
-    if count != len(depths):
-        depths = np.linspace(depths[0], depths[-1], count, dtype=np.float32)
 
-    # y(d) = horizon + c/d, c 는 가장 가까운 점이 화면 아래(y=1)에 오도록 잡는다.
-    c = (1.0 - horizon) * float(depths[0])
-    ys = horizon + c / depths
+def run_receiver(args: argparse.Namespace) -> None:
+    import cv2
+    import numpy as np
 
-    # x 는 이미지 위에서 직선이다. 곧은 차선은 투영해도 직선이므로 y 로 잰다.
-    span = ys[0] - ys[-1]
-    t = (ys[0] - ys) / span if span > 1e-6 else np.zeros_like(ys)
-    xs = near_x + (far_x - near_x) * t
+    config = load_config(args.config)
+    network = config["network"]
+    display = config["display"]
+    width = int(display["width"])
+    height = int(display["height"])
+    bind_host = args.bind_host or str(network["bind_host"])
+    port = args.port or int(network["port"])
+    timeout = float(network["packet_timeout_seconds"])
+    color = tuple(int(value) for value in display["line_color_bgr"])
+    thickness = int(display["line_thickness"])
+    matrix = _build_homography(config["destination_quad_normalized"], width, height)
+    smoother = LaneSmoother(
+        alpha=float(display.get("smoothing_alpha", 0.55)),
+        association_distance=float(display.get("association_distance", 0.18)),
+    )
 
-    # 완만한 곡선. 원거리로 갈수록 크게 흔들려 실제 커브처럼 보인다.
-    xs = xs + 0.035 * t * t * math.sin(phase)
+    receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    receiver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    receiver.bind((bind_host, port))
+    receiver.setblocking(False)
 
-    return [[float(x), float(y)] for x, y in zip(xs, ys)]
+    window_name = str(display["window_name"])
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    if bool(display["fullscreen"]) and not args.windowed:
+        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    else:
+        cv2.resizeWindow(window_name, width, height)
+
+    latest: dict[str, Any] | None = None
+    latest_received = 0.0
+    last_sequence = -1
+    invalid_packets = 0
+    print(f"HUD listening on {bind_host}:{port} / {width}x{height}; Q or Esc to stop")
+
+    try:
+        while True:
+            readable, _, _ = select.select([receiver], [], [], 0.01)
+            if readable:
+                payload, address = receiver.recvfrom(65_535)
+                try:
+                    packet = _decode_packet(payload)
+                    if packet["seq"] >= last_sequence:
+                        packet["lanes"] = smoother.update(packet["lanes"])
+                        latest = packet
+                        latest_received = time.monotonic()
+                        last_sequence = packet["seq"]
+                except (PacketError, ValueError, TypeError):
+                    invalid_packets += 1
+                    if invalid_packets % 30 == 1:
+                        print(f"ignored invalid packet from {address}")
+
+            canvas = np.zeros((height, width, 3), dtype=np.uint8)
+            fresh = latest is not None and time.monotonic() - latest_received <= timeout
+            if fresh and latest["status"] != "lost":
+                for lane in latest["lanes"]:
+                    points = _transform_lane(
+                        lane,
+                        matrix,
+                        flip_horizontal=bool(display["flip_horizontal"]),
+                        flip_vertical=bool(display["flip_vertical"]),
+                    )
+                    cv2.polylines(canvas, [points], False, color, thickness, cv2.LINE_AA)
+                if bool(display.get("show_status", False)):
+                    cv2.putText(
+                        canvas,
+                        f"{latest['status']} | {len(latest['lanes'])} lanes | {latest['fps']:.1f} FPS",
+                        (24, 42),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.75,
+                        color,
+                        2,
+                        cv2.LINE_AA,
+                    )
+            else:
+                smoother.reset()
+
+            cv2.imshow(window_name, canvas)
+            if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        receiver.close()
+        cv2.destroyAllWindows()
+
+
+def run_calibration(args: argparse.Namespace) -> None:
+    import cv2
+    import numpy as np
+
+    config = load_config(args.config)
+    display = config["display"]
+    width = int(display["width"])
+    height = int(display["height"])
+    initial = np.asarray(config["destination_quad_normalized"], dtype=np.float32)
+    points = initial.copy()
+    selected = 0
+    name = "HUD calibration | 1-4 select | arrows move | S save | Q quit"
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    if bool(display["fullscreen"]) and not args.windowed:
+        cv2.setWindowProperty(name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    else:
+        cv2.resizeWindow(name, width, height)
+
+    while True:
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        pixels = np.rint(points * np.asarray([width - 1, height - 1])).astype(np.int32)
+        cv2.polylines(canvas, [pixels], True, (255, 255, 255), 3, cv2.LINE_AA)
+        for index, point in enumerate(pixels):
+            color = (0, 255, 255) if index == selected else (255, 255, 255)
+            cv2.circle(canvas, tuple(point), 14, color, 3, cv2.LINE_AA)
+            cv2.putText(
+                canvas,
+                str(index + 1),
+                tuple(point + [18, -10]),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                color,
+                2,
+            )
+        cv2.putText(
+            canvas,
+            "1-4 SELECT | ARROWS MOVE | S SAVE | R RESET | Q QUIT",
+            (24, height - 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (180, 180, 180),
+            2,
+        )
+        cv2.imshow(name, canvas)
+        key = cv2.waitKeyEx(20)
+        if ord("1") <= key <= ord("4"):
+            selected = key - ord("1")
+        elif key in (81, 2424832):
+            points[selected, 0] -= 0.0025
+        elif key in (83, 2555904):
+            points[selected, 0] += 0.0025
+        elif key in (82, 2490368):
+            points[selected, 1] -= 0.0025
+        elif key in (84, 2621440):
+            points[selected, 1] += 0.0025
+        elif key in (ord("r"), ord("R")):
+            points = initial.copy()
+        elif key in (ord("s"), ord("S")):
+            config["destination_quad_normalized"] = np.round(np.clip(points, 0, 1), 5).tolist()
+            save_config(args.config, config)
+            print(f"calibration saved: {args.config}")
+        elif key in (27, ord("q"), ord("Q")):
+            break
+        points = np.clip(points, 0.0, 1.0)
+    cv2.destroyAllWindows()
+
+
+def _mock_lane(bottom_x: float, top_x: float, phase: float, count: int = 24) -> list[list[float]]:
+    output = []
+    for index in range(count):
+        y = 0.38 + 0.60 * index / (count - 1)
+        progress = (y - 0.38) / 0.60
+        x = top_x + (bottom_x - top_x) * progress**1.45
+        x += 0.012 * math.sin(phase + progress * 2.2)
+        output.append([min(1.0, max(0.0, x)), y])
+    return output
+
+
+def run_mock_sender(args: argparse.Namespace) -> None:
+    host, port_text = args.destination.rsplit(":", 1)
+    sender = HudSender(host, int(port_text))
+    started = time.monotonic()
+    print(f"mock sender -> {host}:{port_text}; Ctrl+C to stop")
+    try:
+        while True:
+            elapsed = time.monotonic() - started
+            lane_change = bool(args.cycle and int(elapsed / 6) % 2)
+            phase = elapsed * 0.8
+            if lane_change:
+                lanes = [
+                    _mock_lane(0.14, 0.42, phase),
+                    _mock_lane(0.50, 0.54, phase + 0.2),
+                    _mock_lane(0.86, 0.68, phase + 0.4),
+                ]
+            else:
+                lanes = [
+                    _mock_lane(0.18, 0.43, phase),
+                    _mock_lane(0.82, 0.57, phase + 0.3),
+                ]
+            sender.send_normalized(
+                lanes,
+                lane_change=lane_change,
+                status="mock",
+                fps=args.fps,
+            )
+            time.sleep(max(0.001, 1.0 / args.fps))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sender.close()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="차선 AR-HUD 표시 및 좌표 송신 어댑터")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    init_parser = subparsers.add_parser("init-config", help="기본 hud_config.json 생성")
+    init_parser.add_argument("--config", type=Path, default=Path("hud_config.json"))
+    init_parser.add_argument("--overwrite", action="store_true")
+
+    receive_parser = subparsers.add_parser("receive", help="UDP 차선 좌표를 전체화면 HUD로 표시")
+    receive_parser.add_argument("--config", type=Path, default=Path("hud_config.json"))
+    receive_parser.add_argument("--bind-host")
+    receive_parser.add_argument("--port", type=int)
+    receive_parser.add_argument("--windowed", action="store_true")
+
+    calibration_parser = subparsers.add_parser("calibrate", help="HUD 사다리꼴 투영 영역 보정")
+    calibration_parser.add_argument("--config", type=Path, default=Path("hud_config.json"))
+    calibration_parser.add_argument("--windowed", action="store_true")
+
+    mock_parser = subparsers.add_parser("mock", help="모델 없이 2/3개 차선 좌표 송신")
+    mock_parser.add_argument("--destination", default="127.0.0.1:5005")
+    mock_parser.add_argument("--fps", type=float, default=22.0)
+    mock_parser.add_argument("--cycle", action="store_true", help="6초마다 일반/차선 변경 전환")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    if args.command == "init-config":
+        write_default_config(args.config, overwrite=args.overwrite)
+    elif args.command == "receive":
+        run_receiver(args)
+    elif args.command == "calibrate":
+        run_calibration(args)
+    elif args.command == "mock":
+        run_mock_sender(args)
+
+
+if __name__ == "__main__":
+    main()

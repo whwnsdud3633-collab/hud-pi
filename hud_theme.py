@@ -34,9 +34,23 @@ CAUTION = (41, 180, 240)     # #f0b429 BGR
 ALERT = (61, 77, 255)        # #ff4d3d BGR
 WHITE = (255, 255, 255)
 
+FILL_STOPS = ((0.0, 0.26), (0.55, 0.10), (1.0, 0.0))
 EDGE_STOPS = ((0.0, 1.0), (0.62, 0.72), (1.0, 0.0))
 DIM_STOPS = ((0.0, 0.34), (0.70, 0.12), (1.0, 0.0))
+ALERT_FILL_STOPS = ((0.0, 0.30), (0.55, 0.10), (1.0, 0.0))
 ALERT_EDGE_STOPS = ((0.0, 1.0), (0.62, 0.70), (1.0, 0.0))
+
+# 거리 틱. 디자인의 y 값(503/428/360/296/240/198)을 리본 안의 상대 위치로
+# 바꿔 놓은 것이다. 0 이 리본 하단, 1 이 소실선 쪽 끝.
+# 실제 HUD 는 도로의 좁은 띠만 덮으므로 고정 y 를 쓰면 틱이 리본 밖으로 나간다.
+TICKS = (
+    (0.100, 4.0, 0.55, 3.0),
+    (0.304, 3.4, 0.44, 2.4),
+    (0.489, 2.8, 0.34, 2.0),
+    (0.663, 2.2, 0.25, 1.6),
+    (0.815, 1.8, 0.17, 0.0),
+    (0.929, 1.4, 0.10, 0.0),
+)
 
 BLINK_PERIOD = 0.820
 
@@ -130,6 +144,17 @@ def _rounded_rect_mask(
                     thickness, cv2.LINE_AA)
 
 
+def _x_at_y(points: np.ndarray, target_y: float) -> float | None:
+    """폴리라인이 주어진 높이를 지나는 x 를 보간한다."""
+    for index in range(len(points) - 1):
+        y1, y2 = float(points[index][1]), float(points[index + 1][1])
+        if (y1 - target_y) * (y2 - target_y) <= 0 and abs(y2 - y1) > 1e-6:
+            ratio = (target_y - y1) / (y2 - y1)
+            x1, x2 = float(points[index][0]), float(points[index + 1][0])
+            return x1 + (x2 - x1) * ratio
+    return None
+
+
 class ThemeRenderer:
     """시안 2a / 2b 를 그리는 렌더러."""
 
@@ -175,7 +200,8 @@ class ThemeRenderer:
         if abs(bottom - self._ramp_range[0]) < 2 and abs(top - self._ramp_range[1]) < 2:
             return
         self._ramp_range = (bottom, top)
-        for name, stops in (("edge", EDGE_STOPS), ("dim", DIM_STOPS),
+        for name, stops in (("fill", FILL_STOPS), ("edge", EDGE_STOPS),
+                            ("dim", DIM_STOPS), ("alert_fill", ALERT_FILL_STOPS),
                             ("alert_edge", ALERT_EDGE_STOPS)):
             self.ramps[name] = _build_ramp(self.height, bottom, top, stops)
 
@@ -259,15 +285,12 @@ class ThemeRenderer:
 
     def _project_lane(self, lane: Any) -> np.ndarray | None:
         clipped = self.mapper.clip_above_horizon(lane)
-        # depths 는 아직 리본 그리기까지 전달되지 않는다. 깊이 가중 눈높이
-        # 보정은 hud_align 안에서 이미 끝나 있어 화면은 맞지만, 틱 배치를
-        # 실제 거리로 잡으려면 아래 필터·정렬을 depths 에도 걸어야 한다.
-        points, depths, valid = self.mapper.project(clipped)
+        points, valid = self.mapper.project(clipped)
         if valid.sum() < 2:
             return None
         points = points[valid]
         # 패널 좌우로 빠져나간 근거리 구간은 리본에서 뺀다. 그대로 두면
-        # 경계선이 화면 아래쪽을 가로질러 시야를 가린다.
+        # 채움이 화면 아래쪽을 통째로 덮어 시야를 가린다.
         margin = int(self.width * 0.02)
         inside = (points[:, 0] >= -margin) & (points[:, 0] <= self.width + margin)
         if inside.sum() < 2:
@@ -299,8 +322,42 @@ class ThemeRenderer:
             )
         phase = (elapsed % BLINK_PERIOD) / BLINK_PERIOD
 
-        # 경계선. 반사 광학계에서는 채움이 그대로 시야를 가리므로
-        # 리본은 좌우 경계선만으로 그린다.
+        # 1. 채움
+        if left is not None and right is not None:
+            polygon = np.vstack([left, right[::-1]])
+            mask = self._clear_mask()
+            cv2.fillPoly(mask, [polygon], 255, cv2.LINE_AA)
+            if alert:
+                pulse = 0.10 + 0.20 * (0.5 - 0.5 * np.cos(2 * np.pi * phase))
+                scale = pulse / 0.30
+                self._paint(mask, ALERT, "alert_fill", scale)
+            else:
+                self._paint(mask, ACCENT, "fill", dim_factor)
+
+        # 2. 거리 틱
+        if left is not None and right is not None:
+            mask = self._clear_mask()
+            drawn = False
+            bottom = float(max(left[0][1], right[0][1]))
+            top = float(min(left[-1][1], right[-1][1]))
+            for index, (position, width, opacity, alert_width) in enumerate(TICKS):
+                if alert and alert_width <= 0:
+                    continue
+                if boot_progress < 1.0 and index > boot_progress * len(TICKS):
+                    continue
+                y = bottom - (bottom - top) * position
+                lx, rx = _x_at_y(left, y), _x_at_y(right, y)
+                if lx is None or rx is None:
+                    continue
+                thickness = self._dw(alert_width if alert else width)
+                value = int(255 * (0.16 if alert else opacity) * dim_factor)
+                cv2.line(mask, (int(lx), int(y)), (int(rx), int(y)),
+                         value, thickness, cv2.LINE_AA)
+                drawn = True
+            if drawn:
+                self._paint(mask, WHITE if alert else ACCENT)
+
+        # 3. 경계선
         for side, points in (("left", left), ("right", right)):
             if points is None:
                 continue

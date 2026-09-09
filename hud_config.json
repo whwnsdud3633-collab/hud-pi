@@ -1,0 +1,55 @@
+{
+  "network": {
+    "bind_host": "0.0.0.0",
+    "port": 5005,
+    "packet_timeout_seconds": 0.35
+  },
+  "display": {
+    "width": 1024,
+    "height": 600,
+    "fullscreen": true,
+    "window_name": "Rain Lane HUD",
+    "line_thickness": 8,
+    "line_color_bgr": [
+      255,
+      255,
+      255
+    ],
+    "flip_horizontal": false,
+    "flip_vertical": false,
+    "show_status": false,
+    "smoothing_alpha": 0.55,
+    "association_distance": 0.18
+  },
+  "destination_quad_normalized": [
+    [
+      0.08,
+      0.08
+    ],
+    [
+      0.92,
+      0.08
+    ],
+    [
+      0.98,
+      0.98
+    ],
+    [
+      0.02,
+      0.98
+    ]
+  ],
+  "alignment": {
+    "mode": "quad",
+    "camera_horizon_y": 0.0,
+    "horizon_margin": 0.18,
+    "pan_x": 0,
+    "pan_y": 0,
+    "pairs": [],
+    "profiles": [],
+    "blend": 0.0
+  },
+  "ui": {
+    "style": "ar_overlay"
+  }
+}
