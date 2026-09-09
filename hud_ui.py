@@ -715,7 +715,7 @@ def run_bench(args: argparse.Namespace) -> None:
         each = (time.perf_counter() - start) / args.frames * 1000.0
         print(f"{warning:16s} {each:6.1f} ms/frame   {1000.0 / each:5.1f} fps")
     print("\ntarget: keep this under 33 ms for 30 fps.")
-    print("if it is slower, lower theme.glow_gain to 0 or raise theme.glow_scale.")
+    print("if it is slower, lower theme.edge_width_ratio.")
 
 
 def build_parser() -> argparse.ArgumentParser:
