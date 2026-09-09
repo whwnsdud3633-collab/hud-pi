@@ -12,8 +12,9 @@
 차선 폴리라인은 추론이 보낸 정규화 좌표를 운전자 시점 정렬 행렬로 투영해서
 그린다.
 
-인식 상태 state(0 정상 / 1 주의 / 2 인식 불가)는 render() 로 받아 self.state 에
-보관만 한다. 화면에 표시하는 것은 다음 단계다.
+인식 상태 state(0 정상 / 1 주의 / 2 인식 불가)는 우측 상단 신호등 3칸으로
+표시한다. 세 칸은 항상 그려지고 현재 state 칸만 밝다. 차선 스타일에 반영하는
+것은 다음 단계다.
 """
 
 from __future__ import annotations
@@ -43,6 +44,15 @@ BLINK_PERIOD = 0.820
 # 그때는 0 으로 본다. hud_ui 도 이 정의를 가져다 쓴다.
 STATE_NORMAL, STATE_CAUTION, STATE_LOST = 0, 1, 2
 LANE_STATES = (STATE_NORMAL, STATE_CAUTION, STATE_LOST)
+
+# 신호등 칸 색. 인덱스가 곧 state 다.
+STATE_COLORS = (
+    (100, 220, 100),     # 0 정상   녹색
+    (100, 220, 240),     # 1 주의   노란색
+    ALERT,               # 2 인식 불가  붉은색. 차선 이탈과 같은 붉은색을 쓴다
+)
+STATE_DIM = 0.18         # 꺼진 칸 밝기
+
 
 def normalize_state(value: Any) -> int:
     """패킷에서 읽은 state 를 0/1/2 로 만든다. 이상하면 0."""
@@ -80,6 +90,12 @@ class ThemeRenderer:
         theme.setdefault("alert_edge_width_ratio", 0.0296)
         theme.setdefault("dim_edge_width_ratio", 0.0111)
         theme.setdefault("boot_animation", True)
+        # 신호등 인디케이터. 전부 디자인 960x540 좌표 기준이다.
+        theme.setdefault("state_indicator", True)
+        theme.setdefault("state_dot_diameter", 16.0)
+        theme.setdefault("state_dot_pitch", 24.0)       # 원 중심 간격
+        theme.setdefault("state_dot_margin_x", 40.0)    # 우측 끝 ~ 마지막 원 중심
+        theme.setdefault("state_dot_center_y", 40.0)
         self.theme = theme
         # hud_ui 의 preview / sample 과 인터페이스를 맞추기 위한 최소 항목
         self.ui = config.setdefault("ui", {})
@@ -102,6 +118,7 @@ class ThemeRenderer:
         self.mask = np.zeros((self.height, self.width), np.uint8)
         self.started = time.monotonic()
         self.state = STATE_NORMAL
+        self._build_state_dots()
 
     def _update_ramps(self, bottom: float, top: float) -> None:
         """원근 페이드를 리본이 실제로 차지한 세로 범위에 맞춘다."""
@@ -236,6 +253,56 @@ class ThemeRenderer:
             else:
                 self._paint(mask, WHITE, "edge", dim_factor)
 
+    # 신호등 ------------------------------------------------------------
+
+    def _build_state_dots(self) -> None:
+        """신호등 칸 하나를 알파 패치로 미리 만들어 둔다.
+
+        프레임마다 원을 다시 그리고 마스크 전체에 boundingRect 를 도는 대신,
+        작은 패치 하나를 세 자리에 더하기만 한다. 반사식은 가장자리 계단이
+        그대로 보이므로 4배로 그린 뒤 INTER_AREA 로 줄여 받는다.
+        """
+        theme = self.theme
+        size = max(2, int(round(float(theme["state_dot_diameter"]) * self.scale)))
+        supersample = 4
+        big = np.zeros((size * supersample, size * supersample), np.uint8)
+        center = size * supersample // 2
+        cv2.circle(big, (center, center), center - supersample, 255, -1)
+        self._state_dot = (
+            cv2.resize(big, (size, size), interpolation=cv2.INTER_AREA)
+            .astype(np.float32) / 255.0
+        )
+
+        pitch = float(theme["state_dot_pitch"])
+        margin = float(theme["state_dot_margin_x"])
+        center_y = float(theme["state_dot_center_y"])
+        last = len(LANE_STATES) - 1
+        self._state_dot_origins = []
+        for index in range(len(LANE_STATES)):
+            cx, cy = self._dp(DESIGN_W - margin - (last - index) * pitch, center_y)
+            x0 = min(max(0, cx - size // 2), max(0, self.width - size))
+            y0 = min(max(0, cy - size // 2), max(0, self.height - size))
+            self._state_dot_origins.append((x0, y0))
+
+    def _draw_state_indicator(self) -> None:
+        """세 칸을 항상 그린다. 현재 state 칸만 100%, 나머지는 18%.
+
+        자리는 지평선(y=172)보다 한참 위인 우측 상단이라 차선 리본과 겹치지
+        않는다. state 2 의 붉은 등과 차선 이탈의 붉은 선이 동시에 떠도
+        화면 위아래로 확실히 떨어져 있다.
+        """
+        if not self.theme["state_indicator"]:
+            return
+        dot = self._state_dot
+        size = dot.shape[0]
+        for index, (x0, y0) in enumerate(self._state_dot_origins):
+            color = STATE_COLORS[index]
+            level = 1.0 if index == self.state else STATE_DIM
+            for channel in range(3):
+                value = color[channel] * level
+                if value:
+                    self.planes[channel][y0:y0 + size, x0:x0 + size] += value * dot
+
     # 출력 --------------------------------------------------------------
 
     def _compose(self) -> np.ndarray:
@@ -285,6 +352,7 @@ class ThemeRenderer:
 
         self._draw_ribbon(left, right, departure_side, elapsed,
                           low_confidence, boot)
+        self._draw_state_indicator()
 
         frame = self._compose()
         if debug is not None and debug.get("show"):
