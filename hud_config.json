@@ -5,8 +5,8 @@
     "packet_timeout_seconds": 0.35
   },
   "display": {
-    "width": 1024,
-    "height": 600,
+    "width": 1280,
+    "height": 720,
     "fullscreen": true,
     "window_name": "Rain Lane HUD",
     "line_thickness": 8,
