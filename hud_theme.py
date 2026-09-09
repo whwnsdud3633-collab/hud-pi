@@ -11,6 +11,9 @@
 
 차선 폴리라인은 추론이 보낸 정규화 좌표를 운전자 시점 정렬 행렬로 투영해서
 그린다.
+
+인식 상태 state(0 정상 / 1 주의 / 2 인식 불가)는 render() 로 받아 self.state 에
+보관만 한다. 신호등과 차선 스타일에 반영하는 것은 다음 단계다.
 """
 
 from __future__ import annotations
@@ -34,6 +37,10 @@ DIM_STOPS = ((0.0, 0.34), (0.70, 0.12), (1.0, 0.0))
 ALERT_EDGE_STOPS = ((0.0, 1.0), (0.62, 0.70), (1.0, 0.0))
 
 BLINK_PERIOD = 0.820
+
+# 인식 상태. 0 정상, 1 주의(차선이 흐릿함), 2 인식 불가
+STATE_NORMAL, STATE_CAUTION, STATE_LOST = 0, 1, 2
+LANE_STATES = (STATE_NORMAL, STATE_CAUTION, STATE_LOST)
 
 
 def _build_ramp(height: int, bottom_y: float, top_y: float, stops) -> np.ndarray:
@@ -84,6 +91,7 @@ class ThemeRenderer:
         self.planes = [np.zeros((self.height, self.width), np.float32) for _ in range(3)]
         self.mask = np.zeros((self.height, self.width), np.uint8)
         self.started = time.monotonic()
+        self.state = STATE_NORMAL
 
     def _update_ramps(self, bottom: float, top: float) -> None:
         """원근 페이드를 리본이 실제로 차지한 세로 범위에 맞춘다."""
@@ -234,8 +242,11 @@ class ThemeRenderer:
         elapsed: float = 0.0,
         debug: dict[str, Any] | None = None,
         telemetry: dict[str, Any] | None = None,
+        state: int = STATE_NORMAL,
     ) -> np.ndarray:
         telemetry = telemetry or {}
+        # 지금은 받아서 보관만 한다
+        self.state = state if state in LANE_STATES else STATE_NORMAL
         for plane in self.planes:
             plane[:] = 0.0
 
@@ -268,9 +279,9 @@ class ThemeRenderer:
 
         frame = self._compose()
         if debug is not None and debug.get("show"):
-            cv2.putText(frame, "ALIGN {}  FPS {:.1f}  SEQ {}".format(
+            cv2.putText(frame, "ALIGN {}  FPS {:.1f}  SEQ {}  STATE {}".format(
                 "cal" if self.calibrated else "uncal",
-                float(debug.get("fps", 0.0)), debug.get("seq", 0)),
+                float(debug.get("fps", 0.0)), debug.get("seq", 0), self.state),
                 (12, self.height - 12), cv2.FONT_HERSHEY_SIMPLEX,
                 0.45 * self.scale + 0.2, (120, 120, 120), 1, cv2.LINE_AA)
         return frame

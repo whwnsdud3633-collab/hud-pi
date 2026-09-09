@@ -45,6 +45,20 @@ WARNING_STATES = (
     "change_right",
 )
 
+# 젯슨이 보내는 인식 상태. 0 정상, 1 주의(차선이 흐릿함), 2 인식 불가.
+# 프로토콜 합의 전이라 패킷에 없을 수 있고, 그때는 0 으로 본다.
+LANE_STATES = (0, 1, 2)
+
+
+def normalize_state(value: Any) -> int:
+    """패킷에서 읽은 state 를 0/1/2 로 만든다. 이상하면 0."""
+    try:
+        state = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return state if state in LANE_STATES else 0
+
+
 DEFAULT_UI: dict[str, Any] = {
     "safe_area": [0.06, 0.06, 0.94, 0.94],
     "lane": {
@@ -176,6 +190,7 @@ class HudRenderer:
         self.ui = ensure_ui_config(config)
         self.rect = (0, 0, self.width, self.height)
         self.static_layer = self._build_static_layer()
+        self.state = 0
 
     @property
     def calibrated(self) -> bool:
@@ -370,6 +385,7 @@ class HudRenderer:
             "STATUS {status}  LANES {lanes}  SEQ {seq}".format(**info),
             "FPS {fps:.1f}  INFER {inference_ms:.1f}ms  AGE {age_ms:.0f}ms".format(**info),
             "RENDER {render_ms:.1f}ms  DROP {dropped}  WARN {warning}".format(**info),
+            f"STATE {self.state}",
             "ALIGN {align}".format(align="driver-calibrated" if self.mapper.calibrated else "UNCALIBRATED (quad fallback)"),
         ]
         for index, line in enumerate(lines):
@@ -395,7 +411,10 @@ class HudRenderer:
         elapsed: float = 0.0,
         debug: dict[str, Any] | None = None,
         telemetry: dict[str, Any] | None = None,
+        state: int = 0,
     ) -> np.ndarray:
+        # 지금은 받아서 보관만 한다
+        self.state = normalize_state(state)
         canvas = self.static_layer.copy()
         emphasis = None
         if warning.startswith("departure"):
@@ -463,6 +482,8 @@ def run_preview(args: argparse.Namespace) -> None:
 
     warning_index = 0
     three_lanes = False
+    state = normalize_state(getattr(args, "state", 0))
+    announced = False
     started = time.monotonic()
 
     while True:
@@ -486,6 +507,7 @@ def run_preview(args: argparse.Namespace) -> None:
             lanes=lanes,
             warning=warning,
             elapsed=elapsed,
+            state=state,
             telemetry={"confidence": 0.7, "fps": 22.0, "inference_ms": 44.6,
                        "departure_distance": 0.3},
             debug=_blank_debug(
@@ -498,6 +520,9 @@ def run_preview(args: argparse.Namespace) -> None:
             ),
         )
         render_ms = (time.perf_counter() - start_render) * 1000.0
+        if not announced:
+            announced = True
+            print(f"renderer state {renderer.state}")
         cv2.putText(
             canvas,
             f"render {render_ms:.1f}ms",
@@ -554,6 +579,7 @@ def run_sample(args: argparse.Namespace) -> None:
     renderer.ui["debug"]["enabled"] = True
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    state = normalize_state(getattr(args, "state", 0))
 
     scenes = {
         "01_normal": ("none", False),
@@ -576,6 +602,7 @@ def run_sample(args: argparse.Namespace) -> None:
             lanes=lanes,
             warning=warning,
             elapsed=0.0,
+            state=state,
             telemetry={"confidence": 0.7, "fps": 22.4, "inference_ms": 44.6,
                        "departure_distance": 0.3},
             debug=_blank_debug(
@@ -589,7 +616,7 @@ def run_sample(args: argparse.Namespace) -> None:
         )
         path = out / f"{name}.png"
         cv2.imwrite(str(path), canvas)
-        print(f"wrote {path}")
+        print(f"wrote {path}  state {renderer.state}")
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +685,7 @@ def run_receive(args: argparse.Namespace) -> None:
                 warning = str(latest.get("warning", "none"))
                 if warning not in WARNING_STATES:
                     warning = "none"
+                state = normalize_state(latest.get("state", 0))
                 telemetry = {
                     "confidence": float(latest.get("confidence", 1.0)),
                     "departure_distance": float(latest.get("departure_distance", 0.0)),
@@ -670,6 +698,7 @@ def run_receive(args: argparse.Namespace) -> None:
                     lanes=latest["lanes"],
                     warning=warning,
                     elapsed=now - started,
+                    state=state,
                     telemetry=telemetry,
                     debug=_blank_debug(
                         status=latest["status"],
@@ -683,7 +712,8 @@ def run_receive(args: argparse.Namespace) -> None:
                     ),
                 )
             else:
-                canvas = renderer.render(lanes=[], warning="none", telemetry={})
+                canvas = renderer.render(lanes=[], warning="none", telemetry={},
+                                         state=0)
 
             _ = (time.perf_counter() - start_render) * 1000.0
             cv2.imshow(name, canvas)
@@ -726,11 +756,15 @@ def build_parser() -> argparse.ArgumentParser:
     preview.add_argument("--config", type=Path, default=Path("hud_config.json"))
     preview.add_argument("--windowed", action="store_true")
     preview.add_argument("--theme", action="store_true", help="AR 오버레이 시안으로")
+    preview.add_argument("--state", type=int, choices=LANE_STATES, default=0,
+                         help="인식 상태 강제 지정. 0 정상 1 주의 2 인식 불가")
 
     sample = subparsers.add_parser("sample", help="상황별 PNG 저장")
     sample.add_argument("--config", type=Path, default=Path("hud_config.json"))
     sample.add_argument("--out", default="hud_samples")
     sample.add_argument("--theme", action="store_true", help="AR 오버레이 시안으로")
+    sample.add_argument("--state", type=int, choices=LANE_STATES, default=0,
+                        help="인식 상태 강제 지정. 0 정상 1 주의 2 인식 불가")
 
     receive = subparsers.add_parser("receive", help="UDP 수신 + 화면 구성")
     receive.add_argument("--config", type=Path, default=Path("hud_config.json"))
