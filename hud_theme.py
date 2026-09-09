@@ -12,9 +12,9 @@
 차선 폴리라인은 추론이 보낸 정규화 좌표를 운전자 시점 정렬 행렬로 투영해서
 그린다.
 
-인식 상태 state(0 정상 / 1 주의 / 2 인식 불가)는 우측 상단 신호등 3칸으로
-표시한다. 세 칸은 항상 그려지고 현재 state 칸만 밝다. 차선 스타일에 반영하는
-것은 다음 단계다.
+인식 상태 state(0 정상 / 1 주의 / 2 인식 불가)는 두 군데에 나타난다.
+우측 상단 신호등 3칸은 항상 세 칸을 그리고 현재 칸만 밝다. 차선은 state 0
+이면 실선 100%, 1 이면 점선 45%, 2 면 아예 그리지 않는다.
 """
 
 from __future__ import annotations
@@ -52,6 +52,9 @@ STATE_COLORS = (
     ALERT,               # 2 인식 불가  붉은색. 차선 이탈과 같은 붉은색을 쓴다
 )
 STATE_DIM = 0.18         # 꺼진 칸 밝기
+
+CAUTION_LEVEL = 0.45     # state 1 차선 밝기
+CONFIDENCE_FLOOR = 0.45  # 이 아래면 state 를 1 로 올린다 (대체 신호)
 
 
 def normalize_state(value: Any) -> int:
@@ -182,6 +185,27 @@ class ThemeRenderer:
             if level:
                 self.planes[channel][y:y + h, x:x + w] += level * patch
 
+    # 상태 --------------------------------------------------------------
+
+    def _resolve_state(
+        self, state: Any, warning: str, telemetry: dict[str, Any]
+    ) -> int:
+        """인식 상태를 한 곳에서 정한다.
+
+        예전에는 telemetry.confidence 로 저신뢰 판정을 따로 해서 점선과 감광을
+        걸었는데, 그게 결국 state 1(주의) 과 같은 이야기였다. 이제 confidence
+        는 젯슨이 state 를 안 실어 보낼 때만 쓰는 대체 신호다. state 가 이미
+        0 이 아니면 그대로 따른다. 신호등과 차선은 여기서 나온 값 하나만 본다.
+
+        차선 이탈 경고 중에는 대체 신호를 쓰지 않는다. 이탈 표시가 우선이고
+        그 선을 끊거나 어둡게 만들 이유가 없다.
+        """
+        resolved = normalize_state(state)
+        if resolved == STATE_NORMAL and warning == "none":
+            if float(telemetry.get("confidence", 1.0)) < CONFIDENCE_FLOOR:
+                return STATE_CAUTION
+        return resolved
+
     # 차선 --------------------------------------------------------------
 
     def _project_lane(self, lane: Any) -> np.ndarray | None:
@@ -206,11 +230,13 @@ class ThemeRenderer:
         right: np.ndarray | None,
         departure_side: str | None,
         elapsed: float,
-        low_confidence: bool,
+        state: int,
         boot_progress: float,
     ) -> None:
         alert = departure_side is not None
-        dim_factor = 0.60 if low_confidence else 1.0
+        # state 1 은 점선 + 45%. 굵기와 색은 차선 이탈 판정이 계속 정한다.
+        dashed = state == STATE_CAUTION
+        level = CAUTION_LEVEL if dashed else 1.0
         present = [p for p in (left, right) if p is not None]
         if present:
             self._update_ramps(
@@ -239,7 +265,7 @@ class ThemeRenderer:
                 width = self._ratio_px(self.theme["dim_edge_width_ratio"])
             else:
                 width = self._ratio_px(self.theme["edge_width_ratio"])
-            if low_confidence:
+            if dashed:
                 for index in range(0, len(reveal) - 1, 2):
                     cv2.line(mask, tuple(reveal[index]), tuple(reveal[index + 1]),
                              255, width, cv2.LINE_AA)
@@ -251,7 +277,7 @@ class ThemeRenderer:
             elif alert:
                 self._paint(mask, WHITE, "dim")
             else:
-                self._paint(mask, WHITE, "edge", dim_factor)
+                self._paint(mask, WHITE, "edge", level)
 
     # 신호등 ------------------------------------------------------------
 
@@ -322,36 +348,36 @@ class ThemeRenderer:
         state: int = STATE_NORMAL,
     ) -> np.ndarray:
         telemetry = telemetry or {}
-        self.state = normalize_state(state)
+        self.state = self._resolve_state(state, warning, telemetry)
         for plane in self.planes:
             plane[:] = 0.0
 
-        confidence = float(telemetry.get("confidence", 1.0))
-        low_confidence = confidence < 0.45 and warning == "none"
         departure_side = None
         if warning.startswith("departure"):
             departure_side = "left" if warning.endswith("_left") else "right"
 
-        boot = 1.0
-        if self.theme["boot_animation"] and departure_side is None:
-            age = time.monotonic() - self.started
-            boot = float(np.clip(age / 1.2, 0.0, 1.0))
+        # state 2 는 차선을 아예 그리지 않는다. 투영까지 건너뛴다.
+        if self.state != STATE_LOST:
+            boot = 1.0
+            if self.theme["boot_animation"] and departure_side is None:
+                age = time.monotonic() - self.started
+                boot = float(np.clip(age / 1.2, 0.0, 1.0))
 
-        projected = [self._project_lane(lane) for lane in lanes]
-        projected = [p for p in projected if p is not None]
-        left = right = None
-        if len(projected) >= 2:
-            projected.sort(key=lambda p: p[0][0])
-            left, right = projected[0], projected[-1]
-        elif len(projected) == 1:
-            single = projected[0]
-            if single[0][0] < self.width / 2:
-                left = single
-            else:
-                right = single
+            projected = [self._project_lane(lane) for lane in lanes]
+            projected = [p for p in projected if p is not None]
+            left = right = None
+            if len(projected) >= 2:
+                projected.sort(key=lambda p: p[0][0])
+                left, right = projected[0], projected[-1]
+            elif len(projected) == 1:
+                single = projected[0]
+                if single[0][0] < self.width / 2:
+                    left = single
+                else:
+                    right = single
 
-        self._draw_ribbon(left, right, departure_side, elapsed,
-                          low_confidence, boot)
+            self._draw_ribbon(left, right, departure_side, elapsed,
+                              self.state, boot)
         self._draw_state_indicator()
 
         frame = self._compose()
