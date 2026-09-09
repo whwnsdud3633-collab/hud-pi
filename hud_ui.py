@@ -723,14 +723,23 @@ def run_bench(args: argparse.Namespace) -> None:
     lanes = [_mock_lane(0.18, 0.43, 0.0), _mock_lane(0.82, 0.57, 0.3)]
     telemetry = {"confidence": 0.7, "fps": 22.4, "inference_ms": 44.6,
                  "departure_distance": 0.3}
-    for warning in ("none", "departure_left"):
-        renderer.render(lanes=lanes, warning=warning, elapsed=0.0, telemetry=telemetry)
+    # 부트 애니메이션이 도는 동안은 선이 짧아 측정이 후하게 나온다. 먼저 태운다.
+    warm = time.perf_counter()
+    while time.perf_counter() - warm < 1.4:
+        renderer.render(lanes=lanes, warning="none", elapsed=0.0, telemetry=telemetry)
+
+    # state 마다 그리는 양이 다르다. 2 는 차선을 아예 안 그린다.
+    for warning, state in (("none", 0), ("none", 1), ("none", 2),
+                           ("departure_left", 0)):
+        renderer.render(lanes=lanes, warning=warning, elapsed=0.0,
+                        state=state, telemetry=telemetry)
         start = time.perf_counter()
         for index in range(args.frames):
-            renderer.render(lanes=lanes, warning=warning,
+            renderer.render(lanes=lanes, warning=warning, state=state,
                             elapsed=index * 0.03, telemetry=telemetry)
         each = (time.perf_counter() - start) / args.frames * 1000.0
-        print(f"{warning:16s} {each:6.1f} ms/frame   {1000.0 / each:5.1f} fps")
+        print(f"{warning:16s} state {state}  {each:6.1f} ms/frame   "
+              f"{1000.0 / each:5.1f} fps")
     print("\ntarget: keep this under 33 ms for 30 fps.")
     print("if it is slower, lower theme.edge_width_ratio.")
 
