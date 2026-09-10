@@ -14,10 +14,11 @@
 그린다.
 
 인식 상태 state(0 정상 / 1 주의 / 2 인식 불가)는 두 군데에 나타난다.
-우측 상단 신호등 3칸은 항상 세 칸을 그리고 현재 칸만 밝다. 차선은 state 0
-이면 녹색 실선 100%, 1 이면 노란색 점선 45%, 2 면 아예 그리지 않는다.
-차선 색은 신호등과 같은 STATE_COLORS 를 쓴다. 차선 이탈 경고는 색에
-관여하지 않고 굵기와 점멸만 바꾼다.
+우측 상단 신호등 3칸은 항상 세 칸을 그리고 현재 칸만 밝다. 차선에서
+state 는 색만 정한다. 0 은 녹색, 1 은 노란색, 2 는 아예 그리지 않는다.
+0 과 1 은 색만 다르고 굵기·모양·밝기가 완전히 같다. 차선 색은 신호등과
+같은 STATE_COLORS 를 쓴다. 차선 이탈 경고도 색에 관여하지 않고 굵기와
+점멸만 바꾼다.
 """
 
 from __future__ import annotations
@@ -55,7 +56,6 @@ STATE_COLORS = (
 )
 STATE_DIM = 0.18         # 꺼진 칸 밝기
 
-CAUTION_LEVEL = 0.45     # state 1 차선 밝기
 CONFIDENCE_FLOOR = 0.45  # 이 아래면 state 를 1 로 올린다 (대체 신호)
 
 
@@ -195,12 +195,13 @@ class ThemeRenderer:
         """인식 상태를 한 곳에서 정한다.
 
         예전에는 telemetry.confidence 로 저신뢰 판정을 따로 해서 점선과 감광을
-        걸었는데, 그게 결국 state 1(주의) 과 같은 이야기였다. 이제 confidence
-        는 젯슨이 state 를 안 실어 보낼 때만 쓰는 대체 신호다. state 가 이미
-        0 이 아니면 그대로 따른다. 신호등과 차선은 여기서 나온 값 하나만 본다.
+        걸었는데, 그게 결국 state 1(주의) 과 같은 이야기였다. 점선과 감광은
+        이제 아예 없고 state 1 은 색만 바뀐다. confidence 는 젯슨이 state 를
+        안 실어 보낼 때만 쓰는 대체 신호로 남았다. state 가 이미 0 이 아니면
+        그대로 따른다. 신호등과 차선은 여기서 나온 값 하나만 본다.
 
-        차선 이탈 경고 중에는 대체 신호를 쓰지 않는다. 이탈 표시가 우선이고
-        그 선을 끊거나 어둡게 만들 이유가 없다.
+        차선 이탈 경고 중에는 대체 신호를 쓰지 않는다. 이탈 표시가 우선이라
+        그때 색까지 흔들 이유가 없다.
         """
         resolved = normalize_state(state)
         if resolved == STATE_NORMAL and warning == "none":
@@ -236,12 +237,10 @@ class ThemeRenderer:
         boot_progress: float,
     ) -> None:
         alert = departure_side is not None
-        # 색은 state 만 정한다. 신호등 인디케이터와 같은 상수를 쓰므로 두
-        # 곳이 갈라지지 않는다. 차선 이탈 경고는 굵기와 점멸로만 나타낸다.
+        # state 는 색만 정한다. 신호등 인디케이터와 같은 상수를 쓰므로 두
+        # 곳이 갈라지지 않는다. state 0 과 1 은 색만 다르고 굵기·모양·밝기가
+        # 같다. 차선 이탈 경고 역시 색은 건드리지 않고 굵기와 점멸만 바꾼다.
         color = STATE_COLORS[state]
-        # state 1 은 점선 + 45%. 이탈 경고 중에도 이 감광은 유지한다.
-        dashed = state == STATE_CAUTION
-        level = CAUTION_LEVEL if dashed else 1.0
         present = [p for p in (left, right) if p is not None]
         if present:
             self._update_ramps(
@@ -270,20 +269,14 @@ class ThemeRenderer:
                 width = self._ratio_px(self.theme["dim_edge_width_ratio"])
             else:
                 width = self._ratio_px(self.theme["edge_width_ratio"])
-            if dashed:
-                for index in range(0, len(reveal) - 1, 2):
-                    cv2.line(mask, tuple(reveal[index]), tuple(reveal[index + 1]),
-                             255, width, cv2.LINE_AA)
-            else:
-                cv2.polylines(mask, [reveal], False, 255, width, cv2.LINE_AA)
+            cv2.polylines(mask, [reveal], False, 255, width, cv2.LINE_AA)
             if departing:
                 on = phase < 0.5                     # steps(1, end)
-                self._paint(mask, color, "alert_edge",
-                            level * (1.0 if on else 0.18))
+                self._paint(mask, color, "alert_edge", 1.0 if on else 0.18)
             elif alert:
-                self._paint(mask, color, "dim", level)
+                self._paint(mask, color, "dim")
             else:
-                self._paint(mask, color, "edge", level)
+                self._paint(mask, color, "edge")
 
     # 신호등 ------------------------------------------------------------
 
