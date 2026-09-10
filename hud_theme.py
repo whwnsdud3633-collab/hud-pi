@@ -3,7 +3,8 @@
 
 반사식 HUD 는 화면 요소가 많을수록 운전자 시야를 가린다. 그래서 좌우 차선
 경계선만 그린다. 리본 채움, 거리 틱, 상단 칩과 상태 스트립, 글로우는 전부
-뺐다. 남은 것은 선 두 개와 차선 이탈 판정에 따른 색·굵기·점멸뿐이다.
+뺐다. 남은 것은 선 두 개와 인식 상태에 따른 색, 차선 이탈 판정에 따른
+굵기·점멸뿐이다.
 
   - 원근 페이드: 마스크를 그린 뒤 세로 방향 알파 램프를 곱한다
   - 합성: 발광 디스플레이라 알파가 아니라 가산으로 쌓는다
@@ -14,7 +15,9 @@
 
 인식 상태 state(0 정상 / 1 주의 / 2 인식 불가)는 두 군데에 나타난다.
 우측 상단 신호등 3칸은 항상 세 칸을 그리고 현재 칸만 밝다. 차선은 state 0
-이면 실선 100%, 1 이면 점선 45%, 2 면 아예 그리지 않는다.
+이면 녹색 실선 100%, 1 이면 노란색 점선 45%, 2 면 아예 그리지 않는다.
+차선 색은 신호등과 같은 STATE_COLORS 를 쓴다. 차선 이탈 경고는 색에
+관여하지 않고 굵기와 점멸만 바꾼다.
 """
 
 from __future__ import annotations
@@ -31,7 +34,6 @@ DESIGN_W, DESIGN_H = 960.0, 540.0
 HORIZON_Y = 172.0
 
 ALERT = (61, 77, 255)        # #ff4d3d BGR
-WHITE = (255, 255, 255)
 
 EDGE_STOPS = ((0.0, 1.0), (0.62, 0.72), (1.0, 0.0))
 DIM_STOPS = ((0.0, 0.34), (0.70, 0.12), (1.0, 0.0))
@@ -49,7 +51,7 @@ LANE_STATES = (STATE_NORMAL, STATE_CAUTION, STATE_LOST)
 STATE_COLORS = (
     (100, 220, 100),     # 0 정상   녹색
     (100, 220, 240),     # 1 주의   노란색
-    ALERT,               # 2 인식 불가  붉은색. 차선 이탈과 같은 붉은색을 쓴다
+    ALERT,               # 2 인식 불가  붉은색
 )
 STATE_DIM = 0.18         # 꺼진 칸 밝기
 
@@ -234,7 +236,10 @@ class ThemeRenderer:
         boot_progress: float,
     ) -> None:
         alert = departure_side is not None
-        # state 1 은 점선 + 45%. 굵기와 색은 차선 이탈 판정이 계속 정한다.
+        # 색은 state 만 정한다. 신호등 인디케이터와 같은 상수를 쓰므로 두
+        # 곳이 갈라지지 않는다. 차선 이탈 경고는 굵기와 점멸로만 나타낸다.
+        color = STATE_COLORS[state]
+        # state 1 은 점선 + 45%. 이탈 경고 중에도 이 감광은 유지한다.
         dashed = state == STATE_CAUTION
         level = CAUTION_LEVEL if dashed else 1.0
         present = [p for p in (left, right) if p is not None]
@@ -273,11 +278,12 @@ class ThemeRenderer:
                 cv2.polylines(mask, [reveal], False, 255, width, cv2.LINE_AA)
             if departing:
                 on = phase < 0.5                     # steps(1, end)
-                self._paint(mask, ALERT, "alert_edge", 1.0 if on else 0.18)
+                self._paint(mask, color, "alert_edge",
+                            level * (1.0 if on else 0.18))
             elif alert:
-                self._paint(mask, WHITE, "dim")
+                self._paint(mask, color, "dim", level)
             else:
-                self._paint(mask, WHITE, "edge", level)
+                self._paint(mask, color, "edge", level)
 
     # 신호등 ------------------------------------------------------------
 
