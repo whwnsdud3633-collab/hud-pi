@@ -227,6 +227,135 @@ class HudSender:
         self.close()
 
 
+# 젯슨 실제 송신 포맷 어댑터 -------------------------------------------------
+#
+# 젯슨은 lanes 배열이 아니라 left/right 를 따로, 그것도 점 배열이 아니라
+# 2차 다항식 계수로 보낸다. 실측 패킷(2026-09-12, 192.168.50.10)에서 확인:
+#
+#   {"v":1,"seq":292,"ts":1789149939.25,"img_w":960,"img_h":540,
+#    "state":0,"conf":1.0,
+#    "left":[-0.003151,0.505674,423.193818],
+#    "right":[-0.008059,5.896502,-500.737265],
+#    "fps":0.0,"id_left":1,"id_right":3,
+#    "event":"","intent":"","extra":null,"y_range":[216.0,410.4]}
+#
+# left/right = [a, b, c] 이고 x = a*y^2 + b*y + c, 좌표 단위는 픽셀,
+# y 의 유효 구간이 y_range = [y_top, y_bottom] 이다. 위 패킷을 풀면
+# left 는 y=216 에서 x=385, y=410 에서 x=100, right 는 같은 구간에서
+# x=397 -> x=562 로 소실점에서 수렴하고 아래에서 벌어진다.
+
+# 계수를 몇 점으로 펴서 보낼지. CLAUDE.md 의 "점 개수 12개 고정" 을 따른다.
+JETSON_LANE_SAMPLES = 12
+
+# status 필드가 없어서 state 로 유추한다.
+JETSON_STATE_STATUS = {0: "ok", 1: "degraded", 2: "lost"}
+
+
+def _is_jetson_packet(packet: dict[str, Any]) -> bool:
+    """lanes 가 없고 left/right 가 있으면 젯슨 포맷으로 본다."""
+    return "lanes" not in packet and ("left" in packet or "right" in packet)
+
+
+def _poly_lane_to_normalized(
+    coefficients: Any,
+    y_range: Any,
+    *,
+    img_w: float,
+    img_h: float,
+    samples: int = JETSON_LANE_SAMPLES,
+) -> list[list[float]]:
+    """2차 계수 + y 구간을 0~1 정규화 폴리라인으로 편다."""
+    if not isinstance(coefficients, (list, tuple)) or len(coefficients) != 3:
+        raise PacketError("lane must be 3 polynomial coefficients")
+    if not all(_finite(value) for value in coefficients):
+        raise PacketError("lane coefficients must be finite")
+    if not isinstance(y_range, (list, tuple)) or len(y_range) != 2:
+        raise PacketError("y_range must be a pair")
+    if not all(_finite(value) for value in y_range):
+        raise PacketError("y_range must be finite")
+
+    a, b, c = (float(value) for value in coefficients)
+    y_top, y_bottom = (float(value) for value in y_range)
+    if y_bottom < y_top:
+        y_top, y_bottom = y_bottom, y_top
+    if y_bottom - y_top < 1.0:
+        raise PacketError("y_range span too small")
+
+    # send_pixels 와 같은 규칙으로 나눈다 (마지막 픽셀이 1.0 이 되도록)
+    width = max(1.0, float(img_w) - 1.0)
+    height = max(1.0, float(img_h) - 1.0)
+
+    points: list[list[float]] = []
+    for index in range(samples):
+        progress = index / (samples - 1)
+        y = y_top + (y_bottom - y_top) * progress
+        x = (a * y + b) * y + c
+        points.append([x / width, y / height])
+    return points
+
+
+def _adapt_jetson_packet(packet: dict[str, Any]) -> None:
+    """젯슨 포맷을 기존 lanes 포맷으로 옮긴다. 원본 키는 지우지 않는다."""
+    img_w = packet.get("img_w")
+    img_h = packet.get("img_h")
+    if not _finite(img_w) or not _finite(img_h):
+        raise PacketError("img_w/img_h must be numbers")
+    if float(img_w) < 2.0 or float(img_h) < 2.0:
+        raise PacketError("img_w/img_h must be at least 2")
+
+    y_range = packet.get("y_range")
+    lanes: list[list[list[float]]] = []
+    for side in ("left", "right"):
+        coefficients = packet.get(side)
+        if coefficients is None:
+            continue
+        # 한쪽이라도 계수가 있으면 y_range 없이는 펼 수 없다
+        lanes.append(
+            _poly_lane_to_normalized(
+                coefficients,
+                y_range,
+                img_w=float(img_w),
+                img_h=float(img_h),
+            )
+        )
+    packet["lanes"] = lanes
+
+    # ts -> sent_at
+    if "sent_at" not in packet and _finite(packet.get("ts")):
+        packet["sent_at"] = float(packet["ts"])
+
+    # status 가 없으면 state 로 유추한다
+    if "status" not in packet:
+        state = packet.get("state")
+        status = None
+        if isinstance(state, bool):
+            state = None
+        if isinstance(state, (int, float)) and _finite(state):
+            status = JETSON_STATE_STATUS.get(int(state))
+        if status is None:
+            # state 도 못 믿으면 HudSender 와 같은 규칙으로 개수를 본다
+            if not lanes:
+                status = "lost"
+            elif len(lanes) < 2:
+                status = "degraded"
+            else:
+                status = "ok"
+        packet["status"] = status
+
+    # conf -> confidence (상태 계층이 읽는 이름)
+    if "confidence" not in packet and _finite(packet.get("conf")):
+        packet["confidence"] = float(packet["conf"])
+
+    # event / intent 는 그대로 살려 두고, 이름이 정확히 일치할 때만
+    # warning 으로 올린다. 젯슨 쪽 어휘를 아직 못 받아서 추측 매핑은 안 한다.
+    if "warning" not in packet:
+        for key in ("event", "intent"):
+            value = packet.get(key)
+            if isinstance(value, str) and value in WARNING_STATES:
+                packet["warning"] = value
+                break
+
+
 def _decode_packet(payload: bytes) -> dict[str, Any]:
     if len(payload) > MAX_DATAGRAM_BYTES:
         raise PacketError("packet exceeds size limit")
@@ -238,6 +367,8 @@ def _decode_packet(payload: bytes) -> dict[str, Any]:
         raise PacketError("packet must be an object")
     if packet.get("v", PROTOCOL_VERSION) != PROTOCOL_VERSION:
         raise PacketError("unsupported protocol version")
+    if _is_jetson_packet(packet):
+        _adapt_jetson_packet(packet)
     sequence = packet.get("seq")
     if not isinstance(sequence, int) or sequence < 0:
         raise PacketError("seq must be a non-negative integer")
