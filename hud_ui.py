@@ -776,16 +776,25 @@ def run_bench(args: argparse.Namespace) -> None:
         renderer.render(lanes=lanes, warning="none", elapsed=0.0, telemetry=telemetry)
 
     # state 마다 그리는 양이 다르다. 2 는 차선을 아예 안 그린다.
-    for warning, state in (("none", 0), ("none", 1), ("none", 2),
-                           ("departure_left", 0)):
-        renderer.render(lanes=lanes, warning=warning, elapsed=0.0,
-                        state=state, telemetry=telemetry)
+    # 무수신 페이드는 신호등이 2 인 채로 차선을 계속 그리므로 따로 잰다.
+    cases = (
+        ("none", 0, None, 1.0),
+        ("none", 1, None, 1.0),
+        ("none", 2, None, 1.0),
+        ("none", 2, 0, 0.5),
+        ("departure_left", 0, None, 1.0),
+    )
+    for warning, state, lane_state, opacity in cases:
+        kwargs = dict(lanes=lanes, warning=warning, state=state,
+                      lane_state=lane_state, lane_opacity=opacity,
+                      telemetry=telemetry)
+        renderer.render(elapsed=0.0, **kwargs)
         start = time.perf_counter()
         for index in range(args.frames):
-            renderer.render(lanes=lanes, warning=warning, state=state,
-                            elapsed=index * 0.03, telemetry=telemetry)
+            renderer.render(elapsed=index * 0.03, **kwargs)
         each = (time.perf_counter() - start) / args.frames * 1000.0
-        print(f"{warning:16s} state {state}  {each:6.1f} ms/frame   "
+        label = "fade" if lane_state is not None else ""
+        print(f"{warning:16s} state {state} {label:5s} {each:6.1f} ms/frame   "
               f"{1000.0 / each:5.1f} fps")
     print("\ntarget: keep this under 33 ms for 30 fps.")
     print("if it is slower, lower theme.edge_width_ratio.")
