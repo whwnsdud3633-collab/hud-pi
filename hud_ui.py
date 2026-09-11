@@ -38,6 +38,7 @@ from hud_theme import (
 from hud_state import StateTracker, ensure_state_config
 from hud_system import (
     PacketError,
+    WARNING_STATES,
     _decode_packet,
     _mock_lane,
     _select_hud_lanes,
@@ -46,14 +47,6 @@ from hud_system import (
     save_config,
 )
 
-
-WARNING_STATES = (
-    "none",
-    "departure_left",
-    "departure_right",
-    "change_left",
-    "change_right",
-)
 
 DEFAULT_UI: dict[str, Any] = {
     "safe_area": [0.06, 0.06, 0.94, 0.94],

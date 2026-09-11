@@ -19,6 +19,14 @@ from typing import Any, Iterable
 
 PROTOCOL_VERSION = 1
 MAX_DATAGRAM_BYTES = 60_000
+# 패킷이 실어 나르는 경고 어휘. 렌더러가 아니라 프로토콜 쪽 값이다.
+WARNING_STATES = (
+    "none",
+    "departure_left",
+    "departure_right",
+    "change_left",
+    "change_right",
+)
 DEFAULT_CONFIG: dict[str, Any] = {
     "network": {
         "bind_host": "0.0.0.0",
