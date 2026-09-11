@@ -19,6 +19,10 @@ state 는 색만 정한다. 0 은 녹색, 1 은 노란색, 2 는 아예 그리�
 0 과 1 은 색만 다르고 굵기·모양·밝기가 완전히 같다. 차선 색은 신호등과
 같은 STATE_COLORS 를 쓴다. 차선 이탈 경고도 색에 관여하지 않고 굵기와
 점멸만 바꾼다.
+
+state 를 언제 무엇으로 볼지는 여기서 정하지 않는다. 무수신 판정, 페이드,
+디바운싱은 hud_state 가 맡고 이 파일은 render() 인자로 받은 state 와
+lane_state / lane_opacity 를 그대로 칠한다.
 """
 
 from __future__ import annotations
@@ -123,6 +127,8 @@ class ThemeRenderer:
         self.mask = np.zeros((self.height, self.width), np.uint8)
         self.started = time.monotonic()
         self.state = STATE_NORMAL
+        self.lane_state = STATE_NORMAL
+        self.lane_opacity = 1.0
         self._build_state_dots()
 
     def _update_ramps(self, bottom: float, top: float) -> None:
@@ -235,6 +241,7 @@ class ThemeRenderer:
         elapsed: float,
         state: int,
         boot_progress: float,
+        opacity: float = 1.0,
     ) -> None:
         alert = departure_side is not None
         # state 는 색만 정한다. 신호등 인디케이터와 같은 상수를 쓰므로 두
@@ -272,11 +279,12 @@ class ThemeRenderer:
             cv2.polylines(mask, [reveal], False, 255, width, cv2.LINE_AA)
             if departing:
                 on = phase < 0.5                     # steps(1, end)
-                self._paint(mask, color, "alert_edge", 1.0 if on else 0.18)
+                self._paint(mask, color, "alert_edge",
+                            opacity * (1.0 if on else 0.18))
             elif alert:
-                self._paint(mask, color, "dim")
+                self._paint(mask, color, "dim", opacity)
             else:
-                self._paint(mask, color, "edge")
+                self._paint(mask, color, "edge", opacity)
 
     # 신호등 ------------------------------------------------------------
 
@@ -345,9 +353,18 @@ class ThemeRenderer:
         debug: dict[str, Any] | None = None,
         telemetry: dict[str, Any] | None = None,
         state: int = STATE_NORMAL,
+        lane_state: int | None = None,
+        lane_opacity: float = 1.0,
     ) -> np.ndarray:
         telemetry = telemetry or {}
         self.state = self._resolve_state(state, warning, telemetry)
+        # 차선 색과 밝기는 신호등 state 와 따로 받을 수 있다. 무수신 페이드
+        # 중에는 신호등만 즉시 붉어지고 차선은 직전 색 그대로 어두워진다.
+        # 판정은 hud_state 가 하고 여기서는 받은 값을 칠하기만 한다.
+        self.lane_state = (
+            self.state if lane_state is None else normalize_state(lane_state)
+        )
+        self.lane_opacity = float(min(1.0, max(0.0, lane_opacity)))
         for plane in self.planes:
             plane[:] = 0.0
 
@@ -356,7 +373,8 @@ class ThemeRenderer:
             departure_side = "left" if warning.endswith("_left") else "right"
 
         # state 2 는 차선을 아예 그리지 않는다. 투영까지 건너뛴다.
-        if self.state != STATE_LOST:
+        # 페이드가 남아 있으면 lane_state 가 직전 값이라 잠시 더 그린다.
+        if self.lane_state != STATE_LOST and self.lane_opacity > 1.0 / 255.0:
             boot = 1.0
             if self.theme["boot_animation"] and departure_side is None:
                 age = time.monotonic() - self.started
@@ -376,7 +394,7 @@ class ThemeRenderer:
                     right = single
 
             self._draw_ribbon(left, right, departure_side, elapsed,
-                              self.state, boot)
+                              self.lane_state, boot, self.lane_opacity)
         self._draw_state_indicator()
 
         frame = self._compose()
