@@ -25,6 +25,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "port": 5005,
         "packet_timeout_seconds": 0.35,
     },
+    "state": {
+        "lane_fade_seconds": 0.4,
+        "caution_timeout_seconds": 1.2,
+        "rise_frames": 3,
+        "fall_frames": 5,
+    },
     "display": {
         "width": 1280,
         "height": 720,
