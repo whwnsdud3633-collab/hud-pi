@@ -48,43 +48,27 @@
 
 ## 파일 구성
 
-### 존재함
-
 | 파일 | 상태 |
 |---|---|
 | `hud_theme.py` | 시안 2a/2b 렌더러. 완성도 높음. 12ms/프레임까지 최적화됨 |
 | `hud_ui.py` | 화면 구성, 경고 판정, preview/sample/receive/bench 서브커맨드 |
+| `hud_system.py` | 패킷 수신·파싱(`_decode_packet`, 젯슨 어댑터), `LaneSmoother`, `_select_hud_lanes`, `_mock_lane`, `HudSender`, config 입출력 |
+| `hud_align.py` | 운전자 시점 정렬. `AlignmentMap.project()` 와 보정 CLI (`preset`/`eyebox`/`profile`/`place`/`pick`/`aim`/`verify`) |
+| `hud_state.py` | 무수신 판정, 페이드, state 디바운싱. `StateTracker` → `HudStatus` |
+| `hud_config.json` | 실행 설정. `display` / `network` / `ui` / `state` / `alignment` |
 
-### 없음 — 작성 필요
+### `hud_proto.py` — 만들지 않는다
 
-`hud_theme.py`와 `hud_ui.py`가 import하지만 저장소에 없다. 두 파일이 기대하는 인터페이스에 정확히 맞춰야 한다.
+한때 "패킷 스키마만 담는 파일을 새로 분리하고 젯슨 쪽과 바이트 단위로
+동일하게 유지한다" 는 계획이 있었다. **폐기한다.** 젯슨이 이미 자체 포맷으로
+쏘고 있어서(계수 + `y_range` + `img_w`/`img_h`, 위 통신 섹션 참조) 공유 스키마
+파일을 양쪽에 두는 전제가 성립하지 않는다. 파이는 젯슨이 보내는 것을
+`hud_system._adapt_jetson_packet` 에서 받아 맞추는 쪽으로 간다.
 
-**`hud_align.py`**
-```python
-ensure_alignment_config(config) -> None      # config에 alignment 기본값 주입
-class AlignmentMap:
-    def __init__(self, config): ...
-    calibrated: bool                          # 실측 보정 여부
-    def clip_above_horizon(self, lane): ...    # 지평선 위 구간 제거
-    def project(self, lane): ...               # -> (points Nx2 int, valid bool 배열)
-```
-
-**`hud_system.py`**
-```python
-class PacketError(Exception): ...
-def _decode_packet(data) -> dict              # UDP 바이트 → 프레임 dict
-def _mock_lane(...)                           # 테스트용 가짜 차선
-def _select_hud_lanes(lanes)                  # 자차 좌/우 차선 선택
-class LaneSmoother: ...                       # 시간축 스무딩
-def load_config(path) / save_config(path, cfg)
-```
-
-**`hud_proto.py`** — 신규 분리
-패킷 스키마만 담는다. `_decode_packet`의 파싱 로직은 여기로 옮기고 `hud_system`은 이를 호출한다.
-
-> **`hud_proto.py`는 젯슨 쪽 담당자와 바이트 단위로 동일해야 한다.**
-> 필드를 추가·삭제·재배치하면 젯슨 쪽 코드가 즉시 깨진다.
-> 변경이 필요하면 코드를 고치지 말고 사람에게 먼저 알릴 것. 변경 시 `VERSION` 상수를 올리고 양쪽을 동시에 교체한다.
+> 대신 이 규칙은 그대로 살아 있다: **와이어 포맷은 파이가 마음대로 바꾸지 않는다.**
+> 젯슨이 보내는 필드를 파이 쪽 사정으로 추가·삭제·재해석하면 그 순간 어긋난다.
+> 포맷 변경이 필요하면 코드를 고치지 말고 젯슨 쪽 담당자에게 먼저 알릴 것.
+> 바꿀 때는 `PROTOCOL_VERSION` 을 올리고 양쪽을 동시에 교체한다.
 
 ---
 
@@ -157,13 +141,18 @@ points = points[inside]     # 또 소실
 단순 픽셀 오프셋은 물리적으로 틀리다. 눈이 `e`만큼 움직이면 거리 `d`의 노면 점은 가상상 평면에서 `e × (1 − d_vi/d)`만큼 움직인다. 가상상 거리 `d_vi = 1m`일 때 5m 점은 `0.8e`, 40m 점은 `0.975e`. 근거리와 원거리 이동량이 다르므로 단일 오프셋으로는 한쪽이 어긋난다.
 
 ```python
-DEPTHS = [5, 8, 11, ..., 40]   # hud_proto의 리샘플 거리와 동일해야 함
+DEPTHS = [5, 8, 11, ..., 40]   # 젯슨이 리샘플하는 종방향 거리와 같아야 함
 D_VI   = 1.0                    # 가상상 거리(m), panel.yaml에서 로드
 
 points[:, 1] += trim_dy * (1.0 - D_VI / depths)
 ```
 
 **이것이 위 "깊이 정보 유실" 문제를 반드시 먼저 고쳐야 하는 이유다.**
+
+> **선행 조건:** 지금 젯슨은 종방향 거리로 리샘플하지 않는다. 2차 계수만
+> 보내고 파이가 영상 y 등간격으로 12점을 편다(통신 섹션 참조). 즉 각 점에
+> 대응하는 실제 거리를 아직 모르므로 `DEPTHS` 를 채울 근거가 없다.
+> 깊이 가중을 붙이기 전에 젯슨 쪽과 리샘플 거리부터 합의해야 한다.
 
 ### 향후 (Level 3)
 
