@@ -27,7 +27,15 @@ import numpy as np
 
 from hud_align import AlignmentMap, ensure_alignment_config
 # 인식 상태 정의는 렌더러 쪽 한 곳(hud_theme)에만 둔다
-from hud_theme import LANE_STATES, ThemeRenderer, normalize_state
+from hud_theme import (
+    LANE_STATES,
+    STATE_LOST,
+    STATE_NORMAL,
+    ThemeRenderer,
+    normalize_state,
+)
+# 무수신 판정, 페이드, 디바운싱은 그리기 코드가 아니라 상태 계층이 맡는다
+from hud_state import StateTracker, ensure_state_config
 from hud_system import (
     PacketError,
     _decode_packet,
@@ -179,6 +187,8 @@ class HudRenderer:
         self.rect = (0, 0, self.width, self.height)
         self.static_layer = self._build_static_layer()
         self.state = 0
+        self.lane_state = 0
+        self.lane_opacity = 1.0
 
     @property
     def calibrated(self) -> bool:
@@ -255,7 +265,7 @@ class HudRenderer:
         emphasis_side: str | None,
     ) -> None:
         style = self.ui["lane"]
-        color = tuple(int(v) for v in style["color_bgr"])
+        color = tuple(int(v * self.lane_opacity) for v in style["color_bgr"])
         base = int(style["thickness"])
         strong = int(style["emphasis_thickness"])
         for lane in lanes:
@@ -400,14 +410,23 @@ class HudRenderer:
         debug: dict[str, Any] | None = None,
         telemetry: dict[str, Any] | None = None,
         state: int = 0,
+        lane_state: int | None = None,
+        lane_opacity: float = 1.0,
     ) -> np.ndarray:
         # 지금은 받아서 보관만 한다
         self.state = normalize_state(state)
+        # 차선 색과 밝기는 신호등 state 와 따로 받는다. ThemeRenderer 와
+        # 인터페이스를 맞춰 두어야 호출부가 렌더러를 갈아끼울 수 있다.
+        self.lane_state = (
+            self.state if lane_state is None else normalize_state(lane_state)
+        )
+        self.lane_opacity = float(min(1.0, max(0.0, lane_opacity)))
         canvas = self.static_layer.copy()
         emphasis = None
         if warning.startswith("departure"):
             emphasis = "left" if warning.endswith("_left") else "right"
-        self._draw_lanes(canvas, lanes, emphasis)
+        if self.lane_state != STATE_LOST and self.lane_opacity > 1.0 / 255.0:
+            self._draw_lanes(canvas, lanes, emphasis)
         self._draw_warning(canvas, warning, elapsed)
         if debug is not None:
             self._draw_debug(canvas, debug)
@@ -614,17 +633,20 @@ def run_sample(args: argparse.Namespace) -> None:
 def run_receive(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     ensure_ui_config(config)
+    ensure_state_config(config)
     renderer = make_renderer(config, getattr(args, "theme", False))
     display = config["display"]
     network = config["network"]
 
     bind_host = args.bind_host or str(network["bind_host"])
     port = args.port or int(network["port"])
-    timeout = float(network["packet_timeout_seconds"])
     smoother = LaneSmoother(
         alpha=float(display.get("smoothing_alpha", 0.55)),
         association_distance=float(display.get("association_distance", 0.18)),
     )
+    # 무수신 판정과 state 디바운싱은 전부 여기에 있다. 이 루프는 판정을
+    # 하지 않고 결과만 받아 그린다.
+    tracker = StateTracker(config)
 
     receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     receiver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -636,7 +658,7 @@ def run_receive(args: argparse.Namespace) -> None:
     print(f"HUD listening on {bind_host}:{port} / {renderer.width}x{renderer.height}")
 
     latest: dict[str, Any] | None = None
-    latest_received = 0.0
+    latest_received: float | None = None
     last_sequence = -1
     dropped = 0
     started = time.monotonic()
@@ -659,50 +681,75 @@ def run_receive(args: argparse.Namespace) -> None:
                         print(f"ignored invalid packet from {address}")
 
             now = time.monotonic()
-            age = now - latest_received if latest is not None else float("inf")
-            fresh = latest is not None and age <= timeout
+            age = now - latest_received if latest_received is not None else float("inf")
 
-            if not fresh:
+            raw_state = STATE_NORMAL
+            confidence = 1.0
+            if latest is not None:
+                raw_state = normalize_state(latest.get("state", STATE_NORMAL))
+                if latest["status"] == "lost":
+                    # 차선을 못 봤다는 뜻이라 state 2 와 같은 이야기다
+                    raw_state = STATE_LOST
+                confidence = float(latest.get("confidence", 1.0))
+            status = tracker.update(
+                now,
+                raw_state=raw_state,
+                confidence=confidence,
+                last_received=latest_received,
+            )
+
+            if status.link_lost:
                 # 송신기가 재시작해 seq 가 0 으로 돌아와도 다시 받아들인다.
                 last_sequence = -1
                 smoother.reset()
 
-            start_render = time.perf_counter()
-            if fresh and latest["status"] != "lost":
+            warning = "none"
+            telemetry: dict[str, Any] = {}
+            info = _blank_debug(
+                status="timeout", dropped=dropped, age_ms=min(age, 9.999) * 1000.0
+            )
+            if latest is not None and not status.link_lost:
                 warning = str(latest.get("warning", "none"))
                 if warning not in WARNING_STATES:
                     warning = "none"
-                state = normalize_state(latest.get("state", 0))
+                # confidence 는 상태 계층이 이미 state 에 반영했다. 렌더러에
+                # 다시 넘기면 디바운싱을 건너뛴 판정이 한 번 더 붙는다.
                 telemetry = {
-                    "confidence": float(latest.get("confidence", 1.0)),
                     "departure_distance": float(latest.get("departure_distance", 0.0)),
                     "lkas": bool(latest.get("lkas", True)),
                     "acc": bool(latest.get("acc", True)),
                     "fps": latest["fps"],
                     "inference_ms": latest["inference_ms"],
                 }
-                canvas = renderer.render(
-                    lanes=latest["lanes"],
+                info = _blank_debug(
+                    status=latest["status"],
+                    lanes=len(latest["lanes"]),
+                    seq=latest["seq"],
+                    fps=latest["fps"],
+                    inference_ms=latest["inference_ms"],
+                    age_ms=age * 1000.0,
+                    dropped=dropped,
                     warning=warning,
-                    elapsed=now - started,
-                    state=state,
-                    telemetry=telemetry,
-                    debug=_blank_debug(
-                        status=latest["status"],
-                        lanes=len(latest["lanes"]),
-                        seq=latest["seq"],
-                        fps=latest["fps"],
-                        inference_ms=latest["inference_ms"],
-                        age_ms=age * 1000.0,
-                        dropped=dropped,
-                        warning=warning,
-                    ),
                 )
-            else:
-                canvas = renderer.render(lanes=[], warning="none", telemetry={},
-                                         state=0)
+            # 페이드가 남아 있는 동안은 마지막으로 받은 좌표를 그대로 어둡게
+            # 깔아 둔다. 뚝 끊기는 것보다 사라지는 편이 덜 놀랍다.
+            lanes: list[Any] = []
+            if latest is not None and status.lanes_visible:
+                lanes = latest["lanes"]
 
+            start_render = time.perf_counter()
+            canvas = renderer.render(
+                lanes=lanes,
+                warning=warning,
+                elapsed=now - started,
+                state=status.state,
+                lane_state=status.lane_state,
+                lane_opacity=status.lane_opacity,
+                telemetry=telemetry,
+                debug=info,
+            )
             _ = (time.perf_counter() - start_render) * 1000.0
+
             cv2.imshow(name, canvas)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
