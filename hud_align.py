@@ -13,11 +13,18 @@
     python3 hud_align.py pick   --frame road.png   # 영상에서 표식 찍기
     python3 hud_align.py aim                       # 운전석에서 HUD 점 맞추기
     python3 hud_align.py verify                    # 겹치는지 확인
+    python3 hud_align.py trim                      # 실데이터 보며 키보드로 미세 보정
+
+trim 은 위 행렬을 다시 풀지 않는다. 행렬로 투영한 결과 위에 운전자 시점
+기준의 작은 보정 행렬 하나(평행이동, 상하 사다리꼴, 좌우 기울기)를 더 곱한다.
+자세한 합성 순서는 TrimParams 와 AlignmentMap.project 에 있다.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -38,14 +45,119 @@ DEFAULT_ALIGNMENT: dict[str, Any] = {
     "pairs": [],
     "profiles": [],
     "blend": 0.0,
+    "trim": {"dx_px": 0.0, "dy_px": 0.0, "keystone": 0.0, "roll_deg": 0.0},
 }
+
+# 트림 한 번 누를 때 움직이는 양. fine 이 기본이고 coarse 는 큰 폭.
+DEFAULT_TRIM_STEP: dict[str, dict[str, float]] = {
+    "fine": {"move_px": 1.0, "keystone": 0.002, "roll_deg": 0.05},
+    "coarse": {"move_px": 8.0, "keystone": 0.01, "roll_deg": 0.5},
+}
+
+# 이 범위를 넘으면 보정이 아니라 설치가 틀어진 것이다. 키를 눌러도 더
+# 가지 않게 막아 두면 사다리꼴 분모가 0 쪽으로 가는 일도 없다.
+TRIM_LIMITS = {"keystone": 0.2, "roll_deg": 15.0}
 
 
 def ensure_alignment_config(config: dict[str, Any]) -> dict[str, Any]:
     section = config.setdefault("alignment", {})
     for key, value in DEFAULT_ALIGNMENT.items():
-        section.setdefault(key, value)
+        section.setdefault(key, dict(value) if isinstance(value, dict) else value)
+    trim = section["trim"]
+    for key, value in DEFAULT_ALIGNMENT["trim"].items():
+        trim.setdefault(key, value)
+    step = section.setdefault("trim_step", {})
+    for size, values in DEFAULT_TRIM_STEP.items():
+        target = step.setdefault(size, {})
+        for key, value in values.items():
+            target.setdefault(key, value)
     return section
+
+
+@dataclass(frozen=True)
+class TrimParams:
+    """기존 정렬 위에 얹는 미세 보정 4개. 전부 운전자가 보는 방향 기준이다.
+
+    dx_px, dy_px  평행이동. 패널 픽셀. +x 는 운전자 기준 오른쪽, +y 는 아래.
+    keystone      상하 사다리꼴. + 면 위쪽 폭이 넓어진다. 화면 맨 아랫줄이 축이라
+                  아랫줄 폭과 높이는 그대로다. 가까운 차선을 평행이동으로 먼저
+                  맞춘 뒤 이것으로 먼 쪽 벌어짐만 맞추면 앞서 맞춘 것이 안 깨진다.
+                  0.01 이면 화면 맨 윗줄 폭이 약 2% 넓어진다.
+    roll_deg      좌우 기울기. 화면 중앙을 축으로 돌린다. + 면 시계 방향이라
+                  오른쪽이 내려가고 왼쪽이 올라간다.
+
+    보정은 화면 중앙 (cx, cy) 을 원점으로, 화면 반 높이 s 를 단위로 한
+    좌표 (u, v) 에서 정의한다. v 는 맨 위가 -1, 맨 아래가 +1 이다. 가로세로에
+    같은 s 를 써야 회전이 찌그러지지 않는다.
+
+        K = [[1, 0, 0], [0, 1, -k], [0, k, 1 - k]]  사다리꼴 (w = 1 + k·(v - 1))
+        R = 회전 roll_deg                          기울기
+        T = 평행이동 (dx/s, dy/s)
+        보정 = N⁻¹ · T · R · K · N                 N 은 픽셀 -> (u, v)
+
+    K 는 아랫줄 v = 1 로 옮긴 뒤 투영 행 [0, k, 1] 을 걸고 되돌린 것이라
+    v = 1 에서 w = 1 이다. 그 위로 갈수록 w 가 1 보다 작아져 벌어진다.
+    투영 성분이라 결과가 여전히 호모그래피이고, 가상상 평면이 아랫변을
+    축으로 살짝 숙여진 것과 같은 변형이다.
+    """
+
+    dx_px: float = 0.0
+    dy_px: float = 0.0
+    keystone: float = 0.0
+    roll_deg: float = 0.0
+
+    @classmethod
+    def from_config(cls, section: dict[str, Any]) -> "TrimParams":
+        raw = section.get("trim") or {}
+        return cls(**{k: float(raw.get(k, 0.0)) for k in cls.__dataclass_fields__})
+
+    def to_config(self) -> dict[str, float]:
+        return {k: round(v, 5) for k, v in asdict(self).items()}
+
+    def clamped(self, width: int, height: int) -> "TrimParams":
+        k_max, r_max = TRIM_LIMITS["keystone"], TRIM_LIMITS["roll_deg"]
+        return replace(
+            self,
+            dx_px=float(np.clip(self.dx_px, -width, width)),
+            dy_px=float(np.clip(self.dy_px, -height, height)),
+            keystone=float(np.clip(self.keystone, -k_max, k_max)),
+            roll_deg=float(np.clip(self.roll_deg, -r_max, r_max)),
+        )
+
+    @property
+    def is_identity(self) -> bool:
+        return not any(asdict(self).values())
+
+    def viewer_matrix(self, width: int, height: int) -> np.ndarray:
+        """운전자가 보는 방향의 픽셀 좌표에서 쓰는 3x3 보정 행렬."""
+        cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
+        s = max(1.0, (height - 1) / 2.0)
+        to_unit = np.array([[1 / s, 0, -cx / s], [0, 1 / s, -cy / s], [0, 0, 1]])
+        from_unit = np.linalg.inv(to_unit)
+        k = self.keystone
+        keystone = np.array([[1, 0, 0], [0, 1, -k], [0, k, 1 - k]])
+        a = math.radians(self.roll_deg)
+        # 영상 좌표는 y 가 아래로 자라므로 이 행렬은 화면에서 시계 방향이다
+        roll = np.array([[math.cos(a), -math.sin(a), 0],
+                         [math.sin(a), math.cos(a), 0],
+                         [0, 0, 1]])
+        move = np.array([[1, 0, self.dx_px / s], [0, 1, self.dy_px / s], [0, 0, 1]])
+        return from_unit @ move @ roll @ keystone @ to_unit
+
+    def panel_matrix(
+        self, width: int, height: int, flip_h: bool, flip_v: bool
+    ) -> np.ndarray:
+        """패널 픽셀 좌표에서 쓰는 보정 행렬.
+
+        반사 광학계가 상을 뒤집으므로 패널에서의 이동은 운전자가 보는
+        이동과 방향이 다르다. 물리적 반전 F 로 감싸 F · V · F 로 바꾼다.
+        그래야 키를 오른쪽으로 누르면 운전자 눈에도 오른쪽으로 간다.
+        반전은 화면 중앙에 대해 대칭이라 사다리꼴 축과 회전 중심이 그대로다.
+        """
+        flip = np.diag([-1.0 if flip_h else 1.0, -1.0 if flip_v else 1.0, 1.0])
+        flip[0, 2] = (width - 1) if flip_h else 0.0
+        flip[1, 2] = (height - 1) if flip_v else 0.0
+        return flip @ self.viewer_matrix(width, height) @ flip   # F 는 자기 역행렬
 
 
 class AlignmentMap:
@@ -64,7 +176,7 @@ class AlignmentMap:
         self.flip_vertical = bool(display.get("flip_vertical", False))
         # 반사 광학계가 실제로 상을 뒤집는지. 대응쌍 모드에서는 반전이 행렬에
         # 흡수되어 위 두 값이 꺼지지만, 운전자 기준 방향을 계산하는 쪽
-        # (상태 바 위치) 은 물리적 반전을 알아야 한다.
+        # (트림, 상태 바 위치) 은 물리적 반전을 알아야 한다.
         self.physical_flip_horizontal = self.flip_horizontal
         self.physical_flip_vertical = self.flip_vertical
 
@@ -87,6 +199,21 @@ class AlignmentMap:
             )
             self.w_floor = 1e-6
             self.calibrated = False
+        self.set_trim(TrimParams.from_config(section))
+
+    def set_trim(self, trim: TrimParams) -> None:
+        """미세 보정만 바꾼다. 기본 행렬은 다시 풀지 않는다.
+
+        렌더러를 rebuild 하지 않고 이것만 부르면 되므로 트림 도구가 키를
+        누를 때마다 부트 애니메이션이 다시 도는 일이 없다.
+        """
+        self.trim = trim.clamped(self.width, self.height)
+        self.trim_matrix = None
+        if not self.trim.is_identity:
+            self.trim_matrix = self.trim.panel_matrix(
+                self.width, self.height,
+                self.physical_flip_horizontal, self.physical_flip_vertical,
+            )
 
     def project(self, points: Any) -> tuple[np.ndarray, np.ndarray]:
         """정규화 좌표 배열을 패널 픽셀과 유효 여부로 돌려준다."""
@@ -108,6 +235,15 @@ class AlignmentMap:
             uv[:, 1] = (self.height - 1) - uv[:, 1]
         uv[:, 0] += self.pan[0]
         uv[:, 1] += self.pan[1]
+
+        # 미세 보정은 최종 패널 좌표 위에 마지막으로 곱한다. 기본 행렬의
+        # w 로 소실선 판정을 끝낸 뒤라 그 판정은 트림과 무관하게 유지된다.
+        # 사다리꼴은 화면에서 아주 먼 점의 w 를 뒤집을 수 있어 따로 거른다.
+        if self.trim_matrix is not None:
+            moved = np.hstack([uv, np.ones((len(uv), 1))]) @ self.trim_matrix.T
+            w = moved[:, 2]
+            valid &= w > 0.05
+            uv[valid] = moved[valid, :2] / w[valid, None]
 
         # 정수 변환 시 넘침을 막기 위해 화면에서 아주 먼 점은 잘라 낸다.
         limit = 10 * max(self.width, self.height)
@@ -704,7 +840,21 @@ def build_parser() -> argparse.ArgumentParser:
     verify = subparsers.add_parser("verify", help="정렬 확인과 미세 조정")
     verify.add_argument("--config", type=Path, default=Path("hud_config.json"))
     verify.add_argument("--windowed", action="store_true")
+
+    trim = subparsers.add_parser("trim", help="실데이터 보며 키보드로 미세 보정")
+    trim.add_argument("--config", type=Path, default=Path("hud_config.json"))
+    trim.add_argument("--windowed", action="store_true")
+    trim.add_argument("--bind-host")
+    trim.add_argument("--port", type=int)
+    trim.add_argument("--mock", action="store_true", help="젯슨 없이 가짜 차선으로")
     return parser
+
+
+def run_trim(args: argparse.Namespace) -> None:
+    # hud_trim 은 렌더러를 쓰고 렌더러는 이 파일을 쓴다. 순환을 피해 늦게 부른다.
+    from hud_trim import run_trim as run
+
+    run(args)
 
 
 def main() -> None:
@@ -717,6 +867,7 @@ def main() -> None:
         "pick": run_pick,
         "aim": run_aim,
         "verify": run_verify,
+        "trim": run_trim,
     }[args.command](args)
 
 

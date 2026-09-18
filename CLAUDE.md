@@ -51,9 +51,10 @@
 | 파일 | 상태 |
 |---|---|
 | `hud_theme.py` | 시안 2a/2b 렌더러. 완성도 높음. 12ms/프레임까지 최적화됨 |
-| `hud_ui.py` | 화면 구성, 경고 판정, preview/sample/receive/bench 서브커맨드 |
+| `hud_ui.py` | 화면 구성, 경고 판정, preview/sample/receive/bench 서브커맨드. `LaneFeed` (수신→스무딩→상태 계층) 는 receive 와 trim 이 같이 쓴다 |
 | `hud_system.py` | 패킷 수신·파싱(`_decode_packet`, 젯슨 어댑터), `LaneSmoother`, `_select_hud_lanes`, `_mock_lane`, `HudSender`, config 입출력 |
-| `hud_align.py` | 운전자 시점 정렬. `AlignmentMap.project()` 와 보정 CLI (`preset`/`eyebox`/`profile`/`place`/`pick`/`aim`/`verify`) |
+| `hud_align.py` | 운전자 시점 정렬. `AlignmentMap.project()`, 미세 보정 `TrimParams`, 보정 CLI (`preset`/`eyebox`/`profile`/`place`/`pick`/`aim`/`verify`/`trim`) |
+| `hud_trim.py` | `trim` 도구 본체. 입력 소스 → `TrimCommand` → `TrimAdjuster` 로 입력과 보정 로직을 분리. 인코더·UDP 입력은 `poll()` 하나만 새로 만들면 된다 |
 | `hud_state.py` | 무수신 판정, 페이드, state 디바운싱. `StateTracker` → `HudStatus` |
 | `hud_config.json` | 실행 설정. `display` / `network` / `ui` / `state` / `alignment` |
 

@@ -55,7 +55,25 @@
     "pan_y": 0,
     "pairs": [],
     "profiles": [],
-    "blend": 0.0
+    "blend": 0.0,
+    "trim": {
+      "dx_px": 0.0,
+      "dy_px": 0.0,
+      "keystone": 0.0,
+      "roll_deg": 0.0
+    },
+    "trim_step": {
+      "fine": {
+        "move_px": 1.0,
+        "keystone": 0.002,
+        "roll_deg": 0.05
+      },
+      "coarse": {
+        "move_px": 8.0,
+        "keystone": 0.01,
+        "roll_deg": 0.5
+      }
+    }
   },
   "ui": {
     "style": "ar_overlay"
