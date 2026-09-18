@@ -623,129 +623,151 @@ def run_sample(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
+class LaneFeed:
+    """UDP 수신 -> 스무딩 -> 상태 계층까지. 렌더러에 넘길 인자를 만든다.
+
+    receive 와 hud_align trim 이 같은 경로로 실데이터를 받도록 한 곳에
+    둔다. 두 곳이 따로 판정하면 보정할 때 본 화면과 주행 때 화면이 달라진다.
+    """
+
+    def __init__(self, config: dict[str, Any], bind_host: str, port: int) -> None:
+        ensure_state_config(config)
+        display = config["display"]
+        self.smoother = LaneSmoother(
+            alpha=float(display.get("smoothing_alpha", 0.55)),
+            association_distance=float(display.get("association_distance", 0.18)),
+            jump_gate_distance=float(display.get("jump_gate_distance", 0.05)),
+            jump_gate_frames=int(display.get("jump_gate_frames", 3)),
+        )
+        # 무수신 판정과 state 디바운싱은 전부 여기에 있다. 이 루프는 판정을
+        # 하지 않고 결과만 받아 그린다.
+        self.tracker = StateTracker(config)
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind((bind_host, port))
+        self.socket.setblocking(False)
+
+        self.latest: dict[str, Any] | None = None
+        self.latest_received: float | None = None
+        self.last_sequence = -1
+        self.dropped = 0
+
+    def close(self) -> None:
+        self.socket.close()
+
+    def poll(self, timeout: float) -> None:
+        """패킷을 최대 한 장 받는다. 없으면 timeout 만큼 기다리고 돌아온다."""
+        readable, _, _ = select.select([self.socket], [], [], timeout)
+        if not readable:
+            return
+        payload, address = self.socket.recvfrom(65_535)
+        try:
+            packet = _decode_packet(payload)
+            if packet["seq"] >= self.last_sequence:
+                packet["lanes"] = self.smoother.update(
+                    packet["lanes"], packet.get("lane_ids")
+                )
+                self.latest = packet
+                self.latest_received = time.monotonic()
+                self.last_sequence = packet["seq"]
+        except (PacketError, ValueError, TypeError):
+            self.dropped += 1
+            if self.dropped % 30 == 1:
+                print(f"ignored invalid packet from {address}")
+
+    def frame(self, now: float) -> dict[str, Any]:
+        """이번 프레임에 그릴 것. elapsed 를 뺀 render() 키워드 인자다."""
+        latest = self.latest
+        age = now - self.latest_received if self.latest_received is not None else float("inf")
+
+        raw_state = STATE_NORMAL
+        confidence = 1.0
+        if latest is not None:
+            raw_state = normalize_state(latest.get("state", STATE_NORMAL))
+            if latest["status"] == "lost":
+                # 차선을 못 봤다는 뜻이라 state 2 와 같은 이야기다
+                raw_state = STATE_LOST
+            confidence = float(latest.get("confidence", 1.0))
+        status = self.tracker.update(
+            now,
+            raw_state=raw_state,
+            confidence=confidence,
+            last_received=self.latest_received,
+        )
+
+        if status.link_lost:
+            # 송신기가 재시작해 seq 가 0 으로 돌아와도 다시 받아들인다.
+            self.last_sequence = -1
+            self.smoother.reset()
+
+        warning = "none"
+        telemetry: dict[str, Any] = {}
+        info = _blank_debug(
+            status="timeout", dropped=self.dropped, age_ms=min(age, 9.999) * 1000.0
+        )
+        if latest is not None and not status.link_lost:
+            warning = str(latest.get("warning", "none"))
+            if warning not in WARNING_STATES:
+                warning = "none"
+            # confidence 는 상태 계층이 이미 state 에 반영했다. 렌더러에
+            # 다시 넘기면 디바운싱을 건너뛴 판정이 한 번 더 붙는다.
+            telemetry = {
+                "departure_distance": float(latest.get("departure_distance", 0.0)),
+                "lkas": bool(latest.get("lkas", True)),
+                "acc": bool(latest.get("acc", True)),
+                "fps": latest["fps"],
+                "inference_ms": latest["inference_ms"],
+            }
+            info = _blank_debug(
+                status=latest["status"],
+                lanes=len(latest["lanes"]),
+                seq=latest["seq"],
+                fps=latest["fps"],
+                inference_ms=latest["inference_ms"],
+                age_ms=age * 1000.0,
+                dropped=self.dropped,
+                warning=warning,
+            )
+        # 페이드가 남아 있는 동안은 마지막으로 받은 좌표를 그대로 어둡게
+        # 깔아 둔다. 뚝 끊기는 것보다 사라지는 편이 덜 놀랍다.
+        lanes: list[Any] = []
+        if latest is not None and status.lanes_visible:
+            lanes = latest["lanes"]
+
+        return dict(
+            lanes=lanes,
+            warning=warning,
+            state=status.state,
+            lane_state=status.lane_state,
+            lane_opacity=status.lane_opacity,
+            telemetry=telemetry,
+            debug=info,
+        )
+
+
 def run_receive(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     ensure_ui_config(config)
-    ensure_state_config(config)
     renderer = make_renderer(config, getattr(args, "theme", False))
     display = config["display"]
     network = config["network"]
 
     bind_host = args.bind_host or str(network["bind_host"])
     port = args.port or int(network["port"])
-    smoother = LaneSmoother(
-        alpha=float(display.get("smoothing_alpha", 0.55)),
-        association_distance=float(display.get("association_distance", 0.18)),
-        jump_gate_distance=float(display.get("jump_gate_distance", 0.05)),
-        jump_gate_frames=int(display.get("jump_gate_frames", 3)),
-    )
-    # 무수신 판정과 state 디바운싱은 전부 여기에 있다. 이 루프는 판정을
-    # 하지 않고 결과만 받아 그린다.
-    tracker = StateTracker(config)
-
-    receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    receiver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    receiver.bind((bind_host, port))
-    receiver.setblocking(False)
+    feed = LaneFeed(config, bind_host, port)
 
     name = str(display["window_name"])
     _open_window(name, renderer, args.windowed, bool(display["fullscreen"]))
     print(f"HUD listening on {bind_host}:{port} / {renderer.width}x{renderer.height}")
 
-    latest: dict[str, Any] | None = None
-    latest_received: float | None = None
-    last_sequence = -1
-    dropped = 0
     started = time.monotonic()
 
     try:
         while True:
-            readable, _, _ = select.select([receiver], [], [], 0.01)
-            if readable:
-                payload, address = receiver.recvfrom(65_535)
-                try:
-                    packet = _decode_packet(payload)
-                    if packet["seq"] >= last_sequence:
-                        packet["lanes"] = smoother.update(
-                            packet["lanes"], packet.get("lane_ids")
-                        )
-                        latest = packet
-                        latest_received = time.monotonic()
-                        last_sequence = packet["seq"]
-                except (PacketError, ValueError, TypeError):
-                    dropped += 1
-                    if dropped % 30 == 1:
-                        print(f"ignored invalid packet from {address}")
-
+            feed.poll(0.01)
             now = time.monotonic()
-            age = now - latest_received if latest_received is not None else float("inf")
-
-            raw_state = STATE_NORMAL
-            confidence = 1.0
-            if latest is not None:
-                raw_state = normalize_state(latest.get("state", STATE_NORMAL))
-                if latest["status"] == "lost":
-                    # 차선을 못 봤다는 뜻이라 state 2 와 같은 이야기다
-                    raw_state = STATE_LOST
-                confidence = float(latest.get("confidence", 1.0))
-            status = tracker.update(
-                now,
-                raw_state=raw_state,
-                confidence=confidence,
-                last_received=latest_received,
-            )
-
-            if status.link_lost:
-                # 송신기가 재시작해 seq 가 0 으로 돌아와도 다시 받아들인다.
-                last_sequence = -1
-                smoother.reset()
-
-            warning = "none"
-            telemetry: dict[str, Any] = {}
-            info = _blank_debug(
-                status="timeout", dropped=dropped, age_ms=min(age, 9.999) * 1000.0
-            )
-            if latest is not None and not status.link_lost:
-                warning = str(latest.get("warning", "none"))
-                if warning not in WARNING_STATES:
-                    warning = "none"
-                # confidence 는 상태 계층이 이미 state 에 반영했다. 렌더러에
-                # 다시 넘기면 디바운싱을 건너뛴 판정이 한 번 더 붙는다.
-                telemetry = {
-                    "departure_distance": float(latest.get("departure_distance", 0.0)),
-                    "lkas": bool(latest.get("lkas", True)),
-                    "acc": bool(latest.get("acc", True)),
-                    "fps": latest["fps"],
-                    "inference_ms": latest["inference_ms"],
-                }
-                info = _blank_debug(
-                    status=latest["status"],
-                    lanes=len(latest["lanes"]),
-                    seq=latest["seq"],
-                    fps=latest["fps"],
-                    inference_ms=latest["inference_ms"],
-                    age_ms=age * 1000.0,
-                    dropped=dropped,
-                    warning=warning,
-                )
-            # 페이드가 남아 있는 동안은 마지막으로 받은 좌표를 그대로 어둡게
-            # 깔아 둔다. 뚝 끊기는 것보다 사라지는 편이 덜 놀랍다.
-            lanes: list[Any] = []
-            if latest is not None and status.lanes_visible:
-                lanes = latest["lanes"]
-
-            start_render = time.perf_counter()
-            canvas = renderer.render(
-                lanes=lanes,
-                warning=warning,
-                elapsed=now - started,
-                state=status.state,
-                lane_state=status.lane_state,
-                lane_opacity=status.lane_opacity,
-                telemetry=telemetry,
-                debug=info,
-            )
-            _ = (time.perf_counter() - start_render) * 1000.0
+            canvas = renderer.render(elapsed=now - started, **feed.frame(now))
 
             cv2.imshow(name, canvas)
             key = cv2.waitKey(1) & 0xFF
@@ -756,7 +778,7 @@ def run_receive(args: argparse.Namespace) -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        receiver.close()
+        feed.close()
         cv2.destroyAllWindows()
 
 
