@@ -25,7 +25,9 @@
     "flip_vertical": false,
     "show_status": false,
     "smoothing_alpha": 0.55,
-    "association_distance": 0.18
+    "association_distance": 0.18,
+    "jump_gate_distance": 0.05,
+    "jump_gate_frames": 3
   },
   "destination_quad_normalized": [
     [

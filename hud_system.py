@@ -51,6 +51,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "show_status": False,
         "smoothing_alpha": 0.55,
         "association_distance": 0.18,
+        # 한 프레임에 허용할 차선 x 이동량(정규화). 실측에서 같은 트랙의
+        # 프레임 간 이동은 p99 가 0.018 이라 0.05 면 정상 주행을 막지 않는다.
+        "jump_gate_distance": 0.05,
+        # 이만큼 연속으로 임계값을 넘으면 실제 이동으로 보고 받아들인다.
+        "jump_gate_frames": 3,
     },
     "destination_quad_normalized": [
         [0.08, 0.08],
@@ -460,7 +465,6 @@ def _adapt_jetson_packet(packet: dict[str, Any]) -> None:
     packet["lanes"] = lanes
     packet["lane_ids"] = lane_ids
 
-
     # ts -> sent_at
     if "sent_at" not in packet and _finite(packet.get("ts")):
         packet["sent_at"] = float(packet["ts"])
@@ -544,12 +548,25 @@ class LaneSmoother:
     버리고 새 차선으로 시작한다.
 
     id 가 없는 패킷(mock, 예전 송신기)은 예전처럼 아래쪽 x 근접도로 잇는다.
+
+    급변 게이트: 한 프레임에 jump_gate_distance 보다 크게 움직이면 그 변화를
+    임계값까지만 반영한다. 급정지처럼 차체가 순간적으로 흔들릴 때 선이 튀는
+    것을 막는다. 다만 jump_gate_frames 연속으로 계속 크게 움직이면 실제로
+    이동한 것이므로 그대로 받아들인다. 아니면 선이 영영 따라오지 못한다.
     """
 
-    def __init__(self, alpha: float, association_distance: float) -> None:
+    def __init__(
+        self,
+        alpha: float,
+        association_distance: float,
+        jump_gate_distance: float = 0.0,
+        jump_gate_frames: int = 3,
+    ) -> None:
         self.alpha = float(alpha)
         self.association_distance = float(association_distance)
-        # 트랙 하나 = {"points": ndarray, "id": Any}
+        self.jump_gate_distance = float(jump_gate_distance)
+        self.jump_gate_frames = int(jump_gate_frames)
+        # 트랙 하나 = {"points": ndarray, "id": Any, "hold": int}
         self.tracks: list[dict[str, Any]] = []
 
     def reset(self) -> None:
@@ -612,12 +629,27 @@ class LaneSmoother:
 
         tracks: list[dict[str, Any]] = []
         for index, (lane, lane_id) in enumerate(current):
+            hold = 0
             track_index = matches[index]
             if track_index is not None:
                 previous = self.tracks[track_index]["points"]
                 previous_x = np.interp(lane[:, 1], previous[:, 1], previous[:, 0])
-                lane[:, 0] = self.alpha * lane[:, 0] + (1.0 - self.alpha) * previous_x
-            tracks.append({"points": lane, "id": lane_id})
+                blended = self.alpha * lane[:, 0] + (1.0 - self.alpha) * previous_x
+                if self.jump_gate_distance > 0.0:
+                    delta = blended - previous_x
+                    if float(np.max(np.abs(delta))) > self.jump_gate_distance:
+                        hold = int(self.tracks[track_index]["hold"]) + 1
+                        if hold <= self.jump_gate_frames:
+                            blended = previous_x + np.clip(
+                                delta,
+                                -self.jump_gate_distance,
+                                self.jump_gate_distance,
+                            )
+                        else:
+                            # 계속 크게 움직인다면 흔들림이 아니라 실제 이동이다.
+                            hold = 0
+                lane[:, 0] = blended
+            tracks.append({"points": lane, "id": lane_id, "hold": hold})
 
         self.tracks = tracks
         return [np.round(track["points"], 5).tolist() for track in tracks]
@@ -671,6 +703,8 @@ def run_receiver(args: argparse.Namespace) -> None:
     smoother = LaneSmoother(
         alpha=float(display.get("smoothing_alpha", 0.55)),
         association_distance=float(display.get("association_distance", 0.18)),
+        jump_gate_distance=float(display.get("jump_gate_distance", 0.05)),
+        jump_gate_frames=int(display.get("jump_gate_frames", 3)),
     )
 
     receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

@@ -636,6 +636,8 @@ def run_receive(args: argparse.Namespace) -> None:
     smoother = LaneSmoother(
         alpha=float(display.get("smoothing_alpha", 0.55)),
         association_distance=float(display.get("association_distance", 0.18)),
+        jump_gate_distance=float(display.get("jump_gate_distance", 0.05)),
+        jump_gate_frames=int(display.get("jump_gate_frames", 3)),
     )
     # 무수신 판정과 state 디바운싱은 전부 여기에 있다. 이 루프는 판정을
     # 하지 않고 결과만 받아 그린다.
