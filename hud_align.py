@@ -24,7 +24,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from hud_system import load_config, save_config
+from hud_system import _clip_polyline, load_config, save_config
 
 MIN_PAIRS = 4
 MAX_PAIRS = 10
@@ -110,11 +110,18 @@ class AlignmentMap:
         return np.rint(uv).astype(np.int32), valid
 
     def clip_above_horizon(self, lane: Any) -> np.ndarray:
-        """지평선 위쪽 점은 버린다. 노면 평면 가정이 깨지는 구간이다."""
+        """지평선 위쪽 점은 버린다. 노면 평면 가정이 깨지는 구간이다.
+
+        경계를 넘나드는 선분은 지평선과의 교점을 끼워 넣어 선이 지평선
+        직전에서 끊기지 않게 한다. 점만 걷어 내면 남은 마지막 점과 지평선
+        사이가 비어 차선이 짧아 보인다.
+        """
         array = np.asarray(lane, dtype=np.float64).reshape(-1, 2)
-        if self.horizon <= 0.0:
+        if self.horizon <= 0.0 or len(array) == 0:
             return array
-        return array[array[:, 1] >= self.horizon]
+        bounds = (-1e9, self.horizon, 1e9, 1e9)
+        clipped = _clip_polyline(array.tolist(), bounds)
+        return np.asarray(clipped, dtype=np.float64).reshape(-1, 2)
 
 
 def quad_matrix(

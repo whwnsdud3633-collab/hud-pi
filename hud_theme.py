@@ -34,6 +34,7 @@ import cv2
 import numpy as np
 
 from hud_align import AlignmentMap, ensure_alignment_config
+from hud_system import _clip_polyline
 
 DESIGN_W, DESIGN_H = 960.0, 540.0
 HORIZON_Y = 172.0
@@ -224,12 +225,14 @@ class ThemeRenderer:
             return None
         points = points[valid]
         # 패널 좌우로 빠져나간 근거리 구간은 리본에서 뺀다. 그대로 두면
-        # 채움이 화면 아래쪽을 통째로 덮어 시야를 가린다.
-        margin = int(self.width * 0.02)
-        inside = (points[:, 0] >= -margin) & (points[:, 0] <= self.width + margin)
-        if inside.sum() < 2:
+        # 채움이 화면 아래쪽을 통째로 덮어 시야를 가린다. 다만 점만 걷어
+        # 내면 경계에서 선이 뚝 끊기므로 경계와의 교점을 끼워 넣는다.
+        margin = float(self.width) * 0.02
+        bounds = (-margin, -1e9, self.width + margin, 1e9)
+        inside = _clip_polyline(points.astype(np.float64).tolist(), bounds)
+        if len(inside) < 2:
             return None
-        points = points[inside]
+        points = np.rint(np.asarray(inside, dtype=np.float64)).astype(np.int32)
         order = np.argsort(-points[:, 1])       # 아래에서 위로
         return points[order]
 

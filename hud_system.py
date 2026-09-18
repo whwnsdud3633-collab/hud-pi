@@ -101,16 +101,117 @@ def _finite(value: object) -> bool:
     )
 
 
+def _segment_span_in_box(
+    first: list[float], second: list[float], bounds: tuple[float, float, float, float]
+) -> tuple[float, float] | None:
+    """선분이 상자 안에 있는 매개변수 구간 [t0, t1] 을 구한다 (Liang-Barsky).
+
+    상자를 전혀 지나지 않으면 None. t 는 first -> second 를 0 -> 1 로 본 값이다.
+    """
+    x_min, y_min, x_max, y_max = bounds
+    dx = second[0] - first[0]
+    dy = second[1] - first[1]
+    t0, t1 = 0.0, 1.0
+    for slope, offset in (
+        (-dx, first[0] - x_min),
+        (dx, x_max - first[0]),
+        (-dy, first[1] - y_min),
+        (dy, y_max - first[1]),
+    ):
+        if slope == 0.0:
+            # 이 축으로 움직이지 않는다. 시작부터 밖이면 통째로 버린다.
+            if offset < 0.0:
+                return None
+            continue
+        ratio = offset / slope
+        if slope < 0.0:
+            if ratio > t1:
+                return None
+            t0 = max(t0, ratio)
+        else:
+            if ratio < t0:
+                return None
+            t1 = min(t1, ratio)
+    return (t0, t1) if t0 <= t1 else None
+
+
+def _lerp_point(first: list[float], second: list[float], t: float) -> list[float]:
+    return [
+        first[0] + (second[0] - first[0]) * t,
+        first[1] + (second[1] - first[1]) * t,
+    ]
+
+
+def _clip_polyline(
+    points: list[list[float]],
+    bounds: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
+) -> list[list[float]]:
+    """상자 밖으로 나간 구간을 버리고, 경계를 넘는 자리에 교점을 끼운다.
+
+    화면 밖 x 를 0 이나 1 로 뭉개면(예전 clamp) 여러 점이 같은 경계값에 몰려
+    테두리를 따라 달리는 수직선이 생긴다. 다항식이 화면 밖을 크게 도는 구간이
+    정확히 그렇다. 그래서 버리는 쪽으로 가되, 그냥 걷어 내면 선이 경계에서
+    뚝 끊기므로 경계와의 교점을 계산해 끝점으로 넣는다.
+
+    상자를 들락날락하면 조각이 여러 개 나온다. 차선은 폴리라인 하나로
+    다뤄지므로 그중 가장 긴 조각만 남긴다.
+    """
+    if len(points) < 2:
+        return []
+
+    pieces: list[list[list[float]]] = []
+    current: list[list[float]] = []
+
+    def flush() -> None:
+        nonlocal current
+        if len(current) >= 2:
+            pieces.append(current)
+        current = []
+
+    for index in range(len(points) - 1):
+        first = points[index]
+        second = points[index + 1]
+        span = _segment_span_in_box(first, second, bounds)
+        if span is None:
+            flush()
+            continue
+        t0, t1 = span
+        if t0 > 0.0:
+            # 이 선분에서 상자로 들어왔다. 앞 조각과는 이어지지 않는다.
+            flush()
+        if not current:
+            current = [_lerp_point(first, second, t0)]
+        current.append(_lerp_point(first, second, t1))
+        if t1 < 1.0:
+            # 이 선분에서 상자를 빠져나갔다.
+            flush()
+    flush()
+
+    if not pieces:
+        return []
+    return max(pieces, key=_path_length)
+
+
+def _path_length(points: list[list[float]]) -> float:
+    total = 0.0
+    for index in range(len(points) - 1):
+        dx = points[index + 1][0] - points[index][0]
+        dy = points[index + 1][1] - points[index][1]
+        total += math.hypot(dx, dy)
+    return total
+
+
 def _sanitize_lane(lane: Iterable[Iterable[float]], max_points: int = 48) -> list[list[float]]:
     points: list[list[float]] = []
     for raw_point in lane:
         point = list(raw_point)
         if len(point) != 2 or not _finite(point[0]) or not _finite(point[1]):
             continue
-        x = min(1.0, max(0.0, float(point[0])))
-        y = min(1.0, max(0.0, float(point[1])))
-        points.append([x, y])
+        points.append([float(point[0]), float(point[1])])
     points.sort(key=lambda item: item[1])
+    # 화면 밖은 clamp 하지 않고 잘라 낸다. clamp 하면 경계에 점이 몰려
+    # 차선이 테두리를 따라 꺾여 올라간다.
+    points = _clip_polyline(points)
     if len(points) > max_points:
         indices = [round(i * (len(points) - 1) / (max_points - 1)) for i in range(max_points)]
         points = [points[index] for index in indices]
