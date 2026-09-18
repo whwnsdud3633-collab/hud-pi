@@ -664,7 +664,9 @@ def run_receive(args: argparse.Namespace) -> None:
                 try:
                     packet = _decode_packet(payload)
                     if packet["seq"] >= last_sequence:
-                        packet["lanes"] = smoother.update(packet["lanes"])
+                        packet["lanes"] = smoother.update(
+                            packet["lanes"], packet.get("lane_ids")
+                        )
                         latest = packet
                         latest_received = time.monotonic()
                         last_sequence = packet["seq"]

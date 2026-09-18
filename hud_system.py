@@ -220,36 +220,57 @@ def _sanitize_lane(lane: Iterable[Iterable[float]], max_points: int = 48) -> lis
     return [[round(x, 5), round(y, 5)] for x, y in points]
 
 
+def _select_hud_lanes_with_ids(
+    lanes: Iterable[Iterable[Iterable[float]]],
+    ids: Iterable[Any] | None = None,
+    *,
+    lane_change: bool,
+) -> tuple[list[list[list[float]]], list[Any]]:
+    """평상시 2개, 차선 변경 시 최대 3개 차선을 선택한다.
+
+    젯슨이 보내는 차선 트랙 id 를 같이 받아 정렬·선택 뒤에도 차선과 짝이
+    유지되게 돌려준다. id 는 LaneSmoother 가 차선 동일성 판정에 쓴다.
+    id 를 모르는 차선 자리에는 None 이 들어간다.
+    """
+    id_list = list(ids) if ids is not None else []
+    valid: list[tuple[list[list[float]], Any]] = []
+    for index, lane in enumerate(lanes):
+        cleaned = _sanitize_lane(lane)
+        if not cleaned:
+            continue
+        lane_id = id_list[index] if index < len(id_list) else None
+        valid.append((cleaned, lane_id))
+    valid.sort(key=lambda item: item[0][-1][0])
+    limit = 3 if lane_change else 2
+    if len(valid) > limit:
+        bottom_x = [lane[-1][0] for lane, _ in valid]
+        if lane_change:
+            selected = sorted(
+                range(len(valid)),
+                key=lambda index: abs(bottom_x[index] - 0.5),
+            )[:3]
+        else:
+            left = [index for index, x in enumerate(bottom_x) if x <= 0.5]
+            right = [index for index, x in enumerate(bottom_x) if x > 0.5]
+            if left and right:
+                selected = [left[-1], right[0]]
+            else:
+                selected = sorted(
+                    range(len(valid)),
+                    key=lambda index: abs(bottom_x[index] - 0.5),
+                )[:2]
+        valid = [valid[index] for index in sorted(selected)]
+    return [lane for lane, _ in valid], [lane_id for _, lane_id in valid]
+
+
 def _select_hud_lanes(
     lanes: Iterable[Iterable[Iterable[float]]],
     *,
     lane_change: bool,
 ) -> list[list[list[float]]]:
     """평상시 2개, 차선 변경 시 최대 3개 차선을 선택한다."""
-    valid = [_sanitize_lane(lane) for lane in lanes]
-    valid = [lane for lane in valid if lane]
-    valid.sort(key=lambda lane: lane[-1][0])
-    limit = 3 if lane_change else 2
-    if len(valid) <= limit:
-        return valid
-
-    bottom_x = [lane[-1][0] for lane in valid]
-    if lane_change:
-        selected = sorted(
-            range(len(valid)),
-            key=lambda index: abs(bottom_x[index] - 0.5),
-        )[:3]
-    else:
-        left = [index for index, x in enumerate(bottom_x) if x <= 0.5]
-        right = [index for index, x in enumerate(bottom_x) if x > 0.5]
-        if left and right:
-            selected = [left[-1], right[0]]
-        else:
-            selected = sorted(
-                range(len(valid)),
-                key=lambda index: abs(bottom_x[index] - 0.5),
-            )[:2]
-    return [valid[index] for index in sorted(selected)]
+    selected, _ = _select_hud_lanes_with_ids(lanes, None, lane_change=lane_change)
+    return selected
 
 
 class HudSender:
@@ -352,6 +373,19 @@ JETSON_LANE_SAMPLES = 12
 JETSON_STATE_STATUS = {0: "ok", 1: "degraded", 2: "lost"}
 
 
+def _lane_track_id(value: Any) -> Any:
+    """차선 트랙 id 를 비교 가능한 값으로 정리한다. 모르면 None."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
 def _is_jetson_packet(packet: dict[str, Any]) -> bool:
     """lanes 가 없고 left/right 가 있으면 젯슨 포맷으로 본다."""
     return "lanes" not in packet and ("left" in packet or "right" in packet)
@@ -406,6 +440,7 @@ def _adapt_jetson_packet(packet: dict[str, Any]) -> None:
 
     y_range = packet.get("y_range")
     lanes: list[list[list[float]]] = []
+    lane_ids: list[Any] = []
     for side in ("left", "right"):
         coefficients = packet.get(side)
         if coefficients is None:
@@ -419,7 +454,12 @@ def _adapt_jetson_packet(packet: dict[str, Any]) -> None:
                 img_h=float(img_h),
             )
         )
+        # 트랙 id 를 차선과 같은 순서로 실어 보낸다. 스무딩이 이걸로 차선
+        # 동일성을 판정한다. 없으면 None 자리를 남겨 근접도 폴백으로 간다.
+        lane_ids.append(_lane_track_id(packet.get(f"id_{side}")))
     packet["lanes"] = lanes
+    packet["lane_ids"] = lane_ids
+
 
     # ts -> sent_at
     if "sent_at" not in packet and _finite(packet.get("ts")):
@@ -480,7 +520,13 @@ def _decode_packet(payload: bytes) -> dict[str, Any]:
     raw_lanes = packet.get("lanes", [])
     if not isinstance(raw_lanes, list):
         raise PacketError("lanes must be a list")
-    packet["lanes"] = _select_hud_lanes(raw_lanes, lane_change=lane_change)
+    raw_ids = packet.get("lane_ids")
+    if not isinstance(raw_ids, list):
+        raw_ids = None
+    # 선택·정렬로 차선 순서가 바뀌므로 id 도 같이 따라가야 짝이 안 어긋난다.
+    packet["lanes"], packet["lane_ids"] = _select_hud_lanes_with_ids(
+        raw_lanes, raw_ids, lane_change=lane_change
+    )
     packet["status"] = status
     packet["lane_change"] = lane_change
     packet["fps"] = float(packet.get("fps", 0.0))
@@ -489,40 +535,92 @@ def _decode_packet(payload: bytes) -> dict[str, Any]:
 
 
 class LaneSmoother:
-    """아래쪽 x 위치로 차선을 대응시켜 HUD 흔들림을 줄인다."""
+    """차선을 프레임 사이에 대응시켜 HUD 흔들림을 줄인다.
+
+    대응은 트랙 id 를 먼저 본다. 젯슨이 id_left / id_right 로 차선 트랙 id 를
+    보내므로, 운전자가 차선을 바꿔 id 가 달라지면 화면상 같은 자리에 있어도
+    다른 차선이다. 근접도로만 이으면 EMA 가 두 차선을 하나로 이어 붙여
+    차선 변경 순간에 없던 급커브가 생긴다. id 가 바뀌면 그 차선의 히스토리를
+    버리고 새 차선으로 시작한다.
+
+    id 가 없는 패킷(mock, 예전 송신기)은 예전처럼 아래쪽 x 근접도로 잇는다.
+    """
 
     def __init__(self, alpha: float, association_distance: float) -> None:
         self.alpha = float(alpha)
         self.association_distance = float(association_distance)
-        self.previous: list[Any] = []
+        # 트랙 하나 = {"points": ndarray, "id": Any}
+        self.tracks: list[dict[str, Any]] = []
 
     def reset(self) -> None:
-        self.previous = []
+        self.tracks = []
 
-    def update(self, lanes: list[list[list[float]]]) -> list[list[list[float]]]:
-        import numpy as np
+    def _associate(self, current: list[tuple[Any, Any]]) -> list[int | None]:
+        """이번 프레임 차선마다 이어 붙일 직전 트랙 번호를 정한다."""
+        unused = set(range(len(self.tracks)))
+        matches: list[int | None] = [None] * len(current)
 
-        current = [np.asarray(lane, dtype=np.float32) for lane in lanes]
-        current.sort(key=lambda lane: float(lane[-1, 0]))
-        unused = set(range(len(self.previous)))
-        smoothed = []
-        for lane in current:
+        # 1) 트랙 id 가 같으면 거리와 무관하게 같은 차선이다.
+        for index, (_, lane_id) in enumerate(current):
+            if lane_id is None:
+                continue
+            for track_index in sorted(unused):
+                if self.tracks[track_index]["id"] == lane_id:
+                    matches[index] = track_index
+                    unused.discard(track_index)
+                    break
+
+        # 2) 남은 것만 근접도로 잇는다. 양쪽 다 id 가 있는데 1) 에서 안 붙었다면
+        #    id 가 바뀐 것이므로 이어서는 안 된다. 한쪽이라도 id 를 모를 때만
+        #    근접도 폴백을 허용한다.
+        for index, (lane, lane_id) in enumerate(current):
+            if matches[index] is not None:
+                continue
             best_index = None
             best_distance = float("inf")
-            for index in unused:
-                distance = abs(float(lane[-1, 0] - self.previous[index][-1, 0]))
+            for track_index in unused:
+                if lane_id is not None and self.tracks[track_index]["id"] is not None:
+                    continue
+                distance = abs(
+                    float(lane[-1, 0] - self.tracks[track_index]["points"][-1, 0])
+                )
                 if distance < best_distance:
                     best_distance = distance
-                    best_index = index
+                    best_index = track_index
             if best_index is not None and best_distance <= self.association_distance:
-                previous = self.previous[best_index]
+                matches[index] = best_index
+                unused.discard(best_index)
+        return matches
+
+    def update(
+        self,
+        lanes: list[list[list[float]]],
+        ids: list[Any] | None = None,
+    ) -> list[list[list[float]]]:
+        import numpy as np
+
+        id_list = list(ids) if ids is not None else []
+        current = [
+            (
+                np.asarray(lane, dtype=np.float32),
+                id_list[index] if index < len(id_list) else None,
+            )
+            for index, lane in enumerate(lanes)
+        ]
+        current.sort(key=lambda item: float(item[0][-1, 0]))
+        matches = self._associate(current)
+
+        tracks: list[dict[str, Any]] = []
+        for index, (lane, lane_id) in enumerate(current):
+            track_index = matches[index]
+            if track_index is not None:
+                previous = self.tracks[track_index]["points"]
                 previous_x = np.interp(lane[:, 1], previous[:, 1], previous[:, 0])
                 lane[:, 0] = self.alpha * lane[:, 0] + (1.0 - self.alpha) * previous_x
-                unused.remove(best_index)
-            lane = np.clip(lane, 0.0, 1.0)
-            smoothed.append(lane)
-        self.previous = smoothed
-        return [np.round(lane, 5).tolist() for lane in smoothed]
+            tracks.append({"points": lane, "id": lane_id})
+
+        self.tracks = tracks
+        return [np.round(track["points"], 5).tolist() for track in tracks]
 
 
 def _build_homography(quad: list[list[float]], width: int, height: int) -> Any:
@@ -601,7 +699,9 @@ def run_receiver(args: argparse.Namespace) -> None:
                 try:
                     packet = _decode_packet(payload)
                     if packet["seq"] >= last_sequence:
-                        packet["lanes"] = smoother.update(packet["lanes"])
+                        packet["lanes"] = smoother.update(
+                            packet["lanes"], packet.get("lane_ids")
+                        )
                         latest = packet
                         latest_received = time.monotonic()
                         last_sequence = packet["seq"]
