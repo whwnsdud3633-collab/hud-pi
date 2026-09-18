@@ -408,7 +408,7 @@ class HudRenderer:
     ) -> np.ndarray:
         # 지금은 받아서 보관만 한다
         self.state = normalize_state(state)
-        # 차선 색과 밝기는 신호등 state 와 따로 받는다. ThemeRenderer 와
+        # 차선 색과 밝기는 상태 바 state 와 따로 받는다. ThemeRenderer 와
         # 인터페이스를 맞춰 두어야 호출부가 렌더러를 갈아끼울 수 있다.
         self.lane_state = (
             self.state if lane_state is None else normalize_state(lane_state)
@@ -773,7 +773,7 @@ def run_bench(args: argparse.Namespace) -> None:
         renderer.render(lanes=lanes, warning="none", elapsed=0.0, telemetry=telemetry)
 
     # state 마다 그리는 양이 다르다. 2 는 차선을 아예 안 그린다.
-    # 무수신 페이드는 신호등이 2 인 채로 차선을 계속 그리므로 따로 잰다.
+    # 무수신 페이드는 상태 바가 2 인 채로 차선을 계속 그리므로 따로 잰다.
     cases = (
         ("none", 0, None, 1.0),
         ("none", 1, None, 1.0),

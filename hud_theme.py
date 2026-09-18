@@ -14,10 +14,10 @@
 그린다.
 
 인식 상태 state(0 정상 / 1 주의 / 2 인식 불가)는 두 군데에 나타난다.
-우측 상단 신호등 3칸은 항상 세 칸을 그리고 현재 칸만 밝다. 차선에서
-state 는 색만 정한다. 0 은 녹색, 1 은 노란색, 2 는 아예 그리지 않는다.
-0 과 1 은 색만 다르고 굵기·모양·밝기가 완전히 같다. 차선 색은 신호등과
-같은 STATE_COLORS 를 쓴다. 차선 이탈 경고도 색에 관여하지 않고 굵기와
+화면 맨 아래를 가로지르는 얇은 상태 바는 state 색 한 가지로 항상 그린다.
+state 2 에서도 그린다. 차선에서 state 는 색만 정한다. 0 은 녹색, 1 은
+노란색, 2 는 아예 그리지 않는다. 0 과 1 은 색만 다르고 굵기·모양·밝기가
+완전히 같다. 차선 색은 상태 바와 같은 STATE_COLORS 를 쓴다. 차선 이탈 경고도 색에 관여하지 않고 굵기와
 점멸만 바꾼다.
 
 state 를 언제 무엇으로 볼지는 여기서 정하지 않는다. 무수신 판정, 페이드,
@@ -53,13 +53,12 @@ BLINK_PERIOD = 0.820
 STATE_NORMAL, STATE_CAUTION, STATE_LOST = 0, 1, 2
 LANE_STATES = (STATE_NORMAL, STATE_CAUTION, STATE_LOST)
 
-# 신호등 칸 색. 인덱스가 곧 state 다.
+# 상태 바와 차선 색. 인덱스가 곧 state 다.
 STATE_COLORS = (
     (100, 220, 100),     # 0 정상   녹색
     (100, 220, 240),     # 1 주의   노란색
     ALERT,               # 2 인식 불가  붉은색
 )
-STATE_DIM = 0.18         # 꺼진 칸 밝기
 
 CONFIDENCE_FLOOR = 0.45  # 이 아래면 state 를 1 로 올린다 (대체 신호)
 
@@ -100,12 +99,10 @@ class ThemeRenderer:
         theme.setdefault("alert_edge_width_ratio", 0.0296)
         theme.setdefault("dim_edge_width_ratio", 0.0111)
         theme.setdefault("boot_animation", True)
-        # 신호등 인디케이터. 전부 디자인 960x540 좌표 기준이다.
-        theme.setdefault("state_indicator", True)
-        theme.setdefault("state_dot_diameter", 16.0)
-        theme.setdefault("state_dot_pitch", 24.0)       # 원 중심 간격
-        theme.setdefault("state_dot_margin_x", 40.0)    # 우측 끝 ~ 마지막 원 중심
-        theme.setdefault("state_dot_center_y", 40.0)
+        # 하단 상태 바. 굵기는 차선과 마찬가지로 화면 높이 비율이다.
+        # 1280x720 에서 0.005 -> 4px.
+        theme.setdefault("state_bar", True)
+        theme.setdefault("state_bar_height_ratio", 0.005)
         self.theme = theme
         # hud_ui 의 preview / sample 과 인터페이스를 맞추기 위한 최소 항목
         self.ui = config.setdefault("ui", {})
@@ -130,7 +127,7 @@ class ThemeRenderer:
         self.state = STATE_NORMAL
         self.lane_state = STATE_NORMAL
         self.lane_opacity = 1.0
-        self._build_state_dots()
+        self._build_state_bar()
 
     def _update_ramps(self, bottom: float, top: float) -> None:
         """원근 페이드를 리본이 실제로 차지한 세로 범위에 맞춘다."""
@@ -205,7 +202,7 @@ class ThemeRenderer:
         걸었는데, 그게 결국 state 1(주의) 과 같은 이야기였다. 점선과 감광은
         이제 아예 없고 state 1 은 색만 바뀐다. confidence 는 젯슨이 state 를
         안 실어 보낼 때만 쓰는 대체 신호로 남았다. state 가 이미 0 이 아니면
-        그대로 따른다. 신호등과 차선은 여기서 나온 값 하나만 본다.
+        그대로 따른다. 상태 바와 차선은 여기서 나온 값 하나만 본다.
 
         차선 이탈 경고 중에는 대체 신호를 쓰지 않는다. 이탈 표시가 우선이라
         그때 색까지 흔들 이유가 없다.
@@ -247,7 +244,7 @@ class ThemeRenderer:
         opacity: float = 1.0,
     ) -> None:
         alert = departure_side is not None
-        # state 는 색만 정한다. 신호등 인디케이터와 같은 상수를 쓰므로 두
+        # state 는 색만 정한다. 하단 상태 바와 같은 상수를 쓰므로 두
         # 곳이 갈라지지 않는다. state 0 과 1 은 색만 다르고 굵기·모양·밝기가
         # 같다. 차선 이탈 경고 역시 색은 건드리지 않고 굵기와 점멸만 바꾼다.
         color = STATE_COLORS[state]
@@ -289,55 +286,36 @@ class ThemeRenderer:
             else:
                 self._paint(mask, color, "edge", opacity)
 
-    # 신호등 ------------------------------------------------------------
+    # 상태 바 ----------------------------------------------------------
 
-    def _build_state_dots(self) -> None:
-        """신호등 칸 하나를 알파 패치로 미리 만들어 둔다.
+    def _build_state_bar(self) -> None:
+        """상태 바가 차지할 행 범위를 미리 정해 둔다.
 
-        프레임마다 원을 다시 그리고 마스크 전체에 boundingRect 를 도는 대신,
-        작은 패치 하나를 세 자리에 더하기만 한다. 반사식은 가장자리 계단이
-        그대로 보이므로 4배로 그린 뒤 INTER_AREA 로 줄여 받는다.
+        운전자가 보는 화면의 아랫면에 붙인다. flip_vertical 이 켜져 있으면
+        패널 윗줄이 운전자에게는 아랫면이므로 위쪽 행을 쓴다. 좌우 반전은
+        화면 폭 전체를 채우는 선이라 상관없다.
         """
-        theme = self.theme
-        size = max(2, int(round(float(theme["state_dot_diameter"]) * self.scale)))
-        supersample = 4
-        big = np.zeros((size * supersample, size * supersample), np.uint8)
-        center = size * supersample // 2
-        cv2.circle(big, (center, center), center - supersample, 255, -1)
-        self._state_dot = (
-            cv2.resize(big, (size, size), interpolation=cv2.INTER_AREA)
-            .astype(np.float32) / 255.0
-        )
+        rows = self._ratio_px(self.theme["state_bar_height_ratio"])
+        rows = min(rows, self.height)
+        if self.mapper.physical_flip_vertical:
+            self._state_bar_rows = (0, rows)
+        else:
+            self._state_bar_rows = (self.height - rows, self.height)
 
-        pitch = float(theme["state_dot_pitch"])
-        margin = float(theme["state_dot_margin_x"])
-        center_y = float(theme["state_dot_center_y"])
-        last = len(LANE_STATES) - 1
-        self._state_dot_origins = []
-        for index in range(len(LANE_STATES)):
-            cx, cy = self._dp(DESIGN_W - margin - (last - index) * pitch, center_y)
-            x0 = min(max(0, cx - size // 2), max(0, self.width - size))
-            y0 = min(max(0, cy - size // 2), max(0, self.height - size))
-            self._state_dot_origins.append((x0, y0))
+    def _draw_state_bar(self) -> None:
+        """화면 폭 전체에 state 색 선 한 줄을 더한다.
 
-    def _draw_state_indicator(self) -> None:
-        """세 칸을 항상 그린다. 현재 state 칸만 100%, 나머지는 18%.
-
-        자리는 지평선(y=172)보다 한참 위인 우측 상단이라 차선 리본과 겹치지
-        않는다. state 2 의 붉은 등과 차선 이탈의 붉은 선이 동시에 떠도
-        화면 위아래로 확실히 떨어져 있다.
+        마스크도 boundingRect 도 필요 없다. 칠할 영역이 몇 줄짜리 띠로
+        정해져 있으니 평면 슬라이스에 바로 더한다. 차선이 화면 아래까지
+        내려와 겹치면 가산이라 그 자리만 조금 밝아진다.
         """
-        if not self.theme["state_indicator"]:
+        if not self.theme["state_bar"]:
             return
-        dot = self._state_dot
-        size = dot.shape[0]
-        for index, (x0, y0) in enumerate(self._state_dot_origins):
-            color = STATE_COLORS[index]
-            level = 1.0 if index == self.state else STATE_DIM
-            for channel in range(3):
-                value = color[channel] * level
-                if value:
-                    self.planes[channel][y0:y0 + size, x0:x0 + size] += value * dot
+        top, bottom = self._state_bar_rows
+        color = STATE_COLORS[self.state]
+        for channel in range(3):
+            if color[channel]:
+                self.planes[channel][top:bottom] += color[channel]
 
     # 출력 --------------------------------------------------------------
 
@@ -361,8 +339,8 @@ class ThemeRenderer:
     ) -> np.ndarray:
         telemetry = telemetry or {}
         self.state = self._resolve_state(state, warning, telemetry)
-        # 차선 색과 밝기는 신호등 state 와 따로 받을 수 있다. 무수신 페이드
-        # 중에는 신호등만 즉시 붉어지고 차선은 직전 색 그대로 어두워진다.
+        # 차선 색과 밝기는 상태 바 state 와 따로 받을 수 있다. 무수신 페이드
+        # 중에는 상태 바만 즉시 붉어지고 차선은 직전 색 그대로 어두워진다.
         # 판정은 hud_state 가 하고 여기서는 받은 값을 칠하기만 한다.
         self.lane_state = (
             self.state if lane_state is None else normalize_state(lane_state)
@@ -398,7 +376,7 @@ class ThemeRenderer:
 
             self._draw_ribbon(left, right, departure_side, elapsed,
                               self.lane_state, boot, self.lane_opacity)
-        self._draw_state_indicator()
+        self._draw_state_bar()
 
         frame = self._compose()
         if debug is not None and debug.get("show"):

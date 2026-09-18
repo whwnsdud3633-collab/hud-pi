@@ -62,6 +62,11 @@ class AlignmentMap:
         self.pairs = list(section["pairs"])
         self.flip_horizontal = bool(display.get("flip_horizontal", False))
         self.flip_vertical = bool(display.get("flip_vertical", False))
+        # 반사 광학계가 실제로 상을 뒤집는지. 대응쌍 모드에서는 반전이 행렬에
+        # 흡수되어 위 두 값이 꺼지지만, 운전자 기준 방향을 계산하는 쪽
+        # (상태 바 위치) 은 물리적 반전을 알아야 한다.
+        self.physical_flip_horizontal = self.flip_horizontal
+        self.physical_flip_vertical = self.flip_vertical
 
         self.horizon_margin = float(section.get("horizon_margin", 0.18))
         self.profiles = list(section.get("profiles", []))

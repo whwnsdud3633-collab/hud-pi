@@ -9,7 +9,7 @@
 1. 무수신은 곧 state 2 다. packet_timeout_seconds 를 넘기면 젯슨이 보내온
    값과 무관하게 2 로 올린다. 젯슨이 죽으면 "차선 못 봄" 이라는 신호조차
    오지 않으므로, 값이 오기를 기다리는 구조는 고장을 정상으로 표시한다.
-2. 차선은 뚝 끊기지 않고 lane_fade_seconds 에 걸쳐 어두워진다. 신호등은
+2. 차선은 뚝 끊기지 않고 lane_fade_seconds 에 걸쳐 어두워진다. 상태 바는
    페이드를 기다리지 않고 즉시 붉어진다. 경고는 늦추지 않는다.
 3. state 1 이 caution_timeout_seconds 이상 이어지면 젯슨이 계속 1 을
    보내더라도 2 로 내린다. state 1 은 추정 궤적이라 오래 띄워 두면 확정된
@@ -61,7 +61,7 @@ def ensure_state_config(config: dict[str, Any]) -> dict[str, Any]:
 class HudStatus:
     """한 프레임의 판정 결과."""
 
-    state: int            # 신호등에 띄울 값
+    state: int            # 상태 바에 띄울 값
     lane_state: int       # 차선 색을 정하는 값. 페이드 중에는 직전 값을 유지한다
     lane_opacity: float   # 차선 밝기 배수 0.0 ~ 1.0
     link_lost: bool       # 패킷이 끊겼는지 (젯슨이 보낸 state 2 와 구분)
