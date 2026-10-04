@@ -185,6 +185,35 @@ ARROW_UP = (65362, 2490368)
 ARROW_RIGHT = (65363, 2555904)
 ARROW_DOWN = (65364, 2621440)
 
+# 숫자 키패드. 운전석에서 한 손으로 쓰라고 둔 배치다.
+#
+#     7 위 좁게   8 위      9 위 넓게
+#     4 왼쪽      5 리셋    6 오른쪽
+#     1 반시계    2 아래    3 시계
+#     0 큰 폭/작은 폭        Enter, + 저장
+#
+# Num Lock 이 켜져 있으면 Qt 가 일반 숫자와 같은 '0'~'9' 로 준다. 꺼져 있으면
+# 키패드 전용 X keysym (KP_Home 등) 이 온다. 둘 다 받는다. 키패드 Enter 는
+# Num Lock 과 상관없이 KP_Enter, + 는 '+' 로 온다.
+KP_HOME, KP_LEFT, KP_UP, KP_RIGHT, KP_DOWN = 65429, 65430, 65431, 65432, 65433
+KP_PRIOR, KP_NEXT, KP_END, KP_BEGIN, KP_INSERT = 65434, 65435, 65436, 65437, 65438
+KP_ENTER = 65421
+KP_ADD = 65451
+
+KEYPAD = {
+    (ord("8"), KP_UP): TrimCommand(MOVE, dy=-1),
+    (ord("2"), KP_DOWN): TrimCommand(MOVE, dy=1),
+    (ord("4"), KP_LEFT): TrimCommand(MOVE, dx=-1),
+    (ord("6"), KP_RIGHT): TrimCommand(MOVE, dx=1),
+    (ord("7"), KP_HOME): TrimCommand(KEYSTONE, sign=-1),   # s 와 같음
+    (ord("9"), KP_PRIOR): TrimCommand(KEYSTONE, sign=1),   # w 와 같음
+    (ord("1"), KP_END): TrimCommand(ROLL, sign=-1),        # a 와 같음
+    (ord("3"), KP_NEXT): TrimCommand(ROLL, sign=1),        # d 와 같음
+    (ord("5"), KP_BEGIN): TrimCommand(RESET),
+    (ord("0"), KP_INSERT): TrimCommand(TOGGLE_STEP),
+    (KP_ENTER, ord("+"), KP_ADD): TrimCommand(SAVE),
+}
+
 KEY_ENTER = (13, 10)
 KEY_ESC = 27
 KEY_TAB = 9
@@ -196,7 +225,10 @@ MODIFIER_KEYS = range(65505, 65519)
 def key_to_command(key: int) -> TrimCommand | None:
     """키 코드 하나를 명령으로 바꾼다. 수식키만 누른 것은 None, 모르는 키는 OTHER.
 
-    큰 폭/작은 폭은 f 또는 Tab 으로 켜고 끈다. Shift 조합은 쓰지 않는다.
+    숫자 키패드 배치는 KEYPAD 에 있다. 키패드가 일반 숫자와 같은 코드로
+    오므로 윗줄 숫자도 같은 동작을 한다.
+
+    큰 폭/작은 폭은 f, Tab, 0 으로 켜고 끈다. Shift 조합은 쓰지 않는다.
     이 파이의 OpenCV(Qt 백엔드) 는 waitKeyEx 에 Shift 상태를 싣지 않아
     Shift+방향키가 방향키와 같은 코드로 오고, Shift+w 도 'w' 로 왔다.
     글자 키는 대소문자를 가리지 않는다. Caps Lock 이 켜져 있어도 된다.
@@ -215,8 +247,9 @@ def key_to_command(key: int) -> TrimCommand | None:
         return TrimCommand(QUIT)
     if key in (KEY_TAB, ord("f"), ord("F")):
         return TrimCommand(TOGGLE_STEP)
-    if key == ord("0"):
-        return TrimCommand(RESET)
+    for codes, command in KEYPAD.items():
+        if key in codes:
+            return command
     letters = {
         "w": (KEYSTONE, 1),     # 위쪽 폭 넓게
         "s": (KEYSTONE, -1),    # 위쪽 폭 좁게
@@ -343,11 +376,17 @@ def run_trim(args: argparse.Namespace) -> None:
     name = "HUD trim"
     _open_window(name, renderer, args.windowed, bool(display["fullscreen"]))
     print("arrows move, w/s keystone, a/d roll, f or tab coarse/fine,")
-    print("0 reset, enter save, q quit")
+    print("enter save, q quit")
+    print("keypad: 8/2/4/6 move, 7/9 keystone, 1/3 roll, 5 reset, 0 step, enter or + save")
     print(_describe(adjuster))
 
     mirror = mapper.physical_flip_horizontal
-    help_line = "arrows move  w/s keystone  a/d roll  f step  0 reset  enter save  q quit"
+    help_lines = [
+        "arrows move  w/s keystone  a/d roll  f step  enter save  q quit",
+        "keypad  7 key-  8 up    9 key+",
+        "        4 left  5 reset 6 right     0 step",
+        "        1 roll- 2 down  3 roll+     enter/+ save",
+    ]
     overlay_key: tuple[Any, ...] | None = None
     overlay = None
     started = time.monotonic()
@@ -364,8 +403,8 @@ def run_trim(args: argparse.Namespace) -> None:
             key_state = (_describe(adjuster), adjuster.confirming_quit, rx)
             if key_state != overlay_key:
                 overlay_key = key_state
-                lines = [(key_state[0] + "   " + rx, OVERLAY_COLOR),
-                         (help_line, OVERLAY_COLOR)]
+                lines = [(key_state[0] + "   " + rx, OVERLAY_COLOR)]
+                lines += [(line, OVERLAY_COLOR) for line in help_lines]
                 if adjuster.confirming_quit:
                     lines.append(("UNSAVED. enter: save+quit  q: discard+quit  other: cancel",
                                   CONFIRM_COLOR))
