@@ -32,6 +32,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "bind_host": "0.0.0.0",
         "port": 5005,
         "packet_timeout_seconds": 0.35,
+        # 커널 수신 버퍼 요청값(바이트). 리눅스는 이 값의 두 배를 잡는다.
+        "recv_buffer_bytes": 16_384,
     },
     "state": {
         "lane_fade_seconds": 0.4,
@@ -538,6 +540,65 @@ def _decode_packet(payload: bytes) -> dict[str, Any]:
     return packet
 
 
+# 기본값 212992B 면 젯슨 패킷(~260B, 커널 계산으로 ~1KB)이 221개, 28fps 로
+# 7.9초치가 쌓인다. 매 프레임 전부 비우므로 평소에는 1~2개만 들어 있고,
+# 버퍼는 렌더가 멈췄을 때만 의미가 있다. 가득 차면 커널은 새 패킷을 버리고
+# 옛 패킷을 남기므로 크게 잡을수록 멈춘 뒤 첫 화면이 더 옛날 것이 된다.
+# 16384 요청 -> 실제 32768, 젯슨 패킷 34개(1.2초)다.
+DEFAULT_RECV_BUFFER_BYTES = 16_384
+
+
+def open_receiver(
+    bind_host: str, port: int, recv_buffer_bytes: int = DEFAULT_RECV_BUFFER_BYTES
+) -> socket.socket:
+    """수신용 논블로킹 UDP 소켓."""
+    receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    receiver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(recv_buffer_bytes))
+    receiver.bind((bind_host, port))
+    receiver.setblocking(False)
+    return receiver
+
+
+def receive_latest(
+    receiver: socket.socket, timeout: float, last_sequence: int
+) -> tuple[dict[str, Any] | None, int, int, Any]:
+    """쌓인 패킷을 전부 꺼내 가장 최근 것 하나만 돌려준다.
+
+    한 번에 하나씩 꺼내면 렌더가 송신보다 느린 순간마다 커널 버퍼에 패킷이
+    쌓이고, 화면은 그만큼 옛날 차선을 계속 그린다.
+    seq 가 last_sequence 보다 작은 패킷(역전)은 쓰지 않는다.
+
+    반환: (패킷 또는 None, 안 쓰고 버린 정상 패킷 수, 깨진 패킷 수,
+    마지막 깨진 패킷의 송신 주소)
+    """
+    readable, _, _ = select.select([receiver], [], [], timeout)
+    if not readable:
+        return None, 0, 0, None
+    best: dict[str, Any] | None = None
+    valid = 0
+    invalid = 0
+    invalid_address = None
+    while True:
+        try:
+            payload, address = receiver.recvfrom(65_535)
+        except BlockingIOError:
+            break
+        try:
+            packet = _decode_packet(payload)
+        except (PacketError, ValueError, TypeError):
+            invalid += 1
+            invalid_address = address
+            continue
+        valid += 1
+        if packet["seq"] < last_sequence:
+            continue
+        if best is None or packet["seq"] >= best["seq"]:
+            best = packet
+    skipped = valid - (1 if best is not None else 0)
+    return best, skipped, invalid, invalid_address
+
+
 class LaneSmoother:
     """차선을 프레임 사이에 대응시켜 HUD 흔들림을 줄인다.
 
@@ -707,10 +768,11 @@ def run_receiver(args: argparse.Namespace) -> None:
         jump_gate_frames=int(display.get("jump_gate_frames", 3)),
     )
 
-    receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    receiver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    receiver.bind((bind_host, port))
-    receiver.setblocking(False)
+    receiver = open_receiver(
+        bind_host,
+        port,
+        int(network.get("recv_buffer_bytes", DEFAULT_RECV_BUFFER_BYTES)),
+    )
 
     window_name = str(display["window_name"])
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -727,22 +789,18 @@ def run_receiver(args: argparse.Namespace) -> None:
 
     try:
         while True:
-            readable, _, _ = select.select([receiver], [], [], 0.01)
-            if readable:
-                payload, address = receiver.recvfrom(65_535)
-                try:
-                    packet = _decode_packet(payload)
-                    if packet["seq"] >= last_sequence:
-                        packet["lanes"] = smoother.update(
-                            packet["lanes"], packet.get("lane_ids")
-                        )
-                        latest = packet
-                        latest_received = time.monotonic()
-                        last_sequence = packet["seq"]
-                except (PacketError, ValueError, TypeError):
-                    invalid_packets += 1
-                    if invalid_packets % 30 == 1:
-                        print(f"ignored invalid packet from {address}")
+            packet, _, invalid, address = receive_latest(receiver, 0.01, last_sequence)
+            for _ in range(invalid):
+                invalid_packets += 1
+                if invalid_packets % 30 == 1:
+                    print(f"ignored invalid packet from {address}")
+            if packet is not None:
+                packet["lanes"] = smoother.update(
+                    packet["lanes"], packet.get("lane_ids")
+                )
+                latest = packet
+                latest_received = time.monotonic()
+                last_sequence = packet["seq"]
 
             canvas = np.zeros((height, width, 3), dtype=np.uint8)
             fresh = latest is not None and time.monotonic() - latest_received <= timeout
