@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import select
 import socket
 import time
 from pathlib import Path
@@ -41,13 +40,14 @@ from hud_theme import (
 # 무수신 판정, 페이드, 디바운싱은 그리기 코드가 아니라 상태 계층이 맡는다
 from hud_state import StateTracker, ensure_state_config
 from hud_system import (
-    PacketError,
+    DEFAULT_RECV_BUFFER_BYTES,
     WARNING_STATES,
-    _decode_packet,
     _mock_lane,
     _select_hud_lanes,
     LaneSmoother,
     load_config,
+    open_receiver,
+    receive_latest,
     save_config,
 )
 
@@ -379,7 +379,8 @@ class HudRenderer:
         lines = [
             "STATUS {status}  LANES {lanes}  SEQ {seq}".format(**info),
             "FPS {fps:.1f}  INFER {inference_ms:.1f}ms  AGE {age_ms:.0f}ms".format(**info),
-            "RENDER {render_ms:.1f}ms  DROP {dropped}  WARN {warning}".format(**info),
+            "RENDER {render_ms:.1f}ms  BAD {dropped}  WARN {warning}".format(**info),
+            _latency_line(info),
             f"STATE {self.state}",
             "ALIGN {align}".format(align="driver-calibrated" if self.mapper.calibrated else "UNCALIBRATED (quad fallback)"),
         ]
@@ -447,10 +448,23 @@ def _blank_debug(**overrides: Any) -> dict[str, Any]:
         "age_ms": 0.0,
         "render_ms": 0.0,
         "dropped": 0,
+        "skipped": 0,
+        "lag_ms": None,
+        "queue_ms": None,
         "warning": "none",
     }
     info.update(overrides)
     return info
+
+
+def _latency_line(info: dict[str, Any]) -> str:
+    """젯슨 ts 기준 지연. LAG 는 시계 차이를 포함한 원값, Q 는 지금까지 본
+    최솟값을 뺀 값이라 시계 차이가 빠지고 밀린 만큼만 남는다."""
+    lag = info.get("lag_ms")
+    queue = info.get("queue_ms")
+    lag_text = "--" if lag is None else f"{lag:.0f}ms"
+    queue_text = "--" if queue is None else f"{queue:.0f}ms"
+    return f"LAG {lag_text}  Q {queue_text}  SKIP {info.get('skipped', 0)}"
 
 
 def _open_window(name: str, renderer: HudRenderer, windowed: bool, fullscreen: bool) -> None:
@@ -867,38 +881,44 @@ class LaneFeed:
         # 하지 않고 결과만 받아 그린다.
         self.tracker = StateTracker(config)
 
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.socket.bind((bind_host, port))
-        self.socket.setblocking(False)
+        network = config.get("network", {})
+        self.socket = open_receiver(
+            bind_host,
+            port,
+            int(network.get("recv_buffer_bytes", DEFAULT_RECV_BUFFER_BYTES)),
+        )
 
         self.latest: dict[str, Any] | None = None
         self.latest_received: float | None = None
         self.last_sequence = -1
+        # 깨진 패킷 수
         self.dropped = 0
+        # 더 새 패킷이 같이 쌓여 있어서 안 쓰고 버린 정상 패킷 수
+        self.skipped = 0
+        # 지연 측정. 젯슨 ts 는 epoch 초라 파이 시계와 차이가 섞여 있으므로
+        # 최솟값을 기준선으로 잡고 그 위로 얼마나 밀렸는지를 따로 본다.
+        self.lag_ms: float | None = None
+        self.lag_floor_ms: float | None = None
 
     def close(self) -> None:
         self.socket.close()
 
     def poll(self, timeout: float) -> None:
-        """패킷을 최대 한 장 받는다. 없으면 timeout 만큼 기다리고 돌아온다."""
-        readable, _, _ = select.select([self.socket], [], [], timeout)
-        if not readable:
-            return
-        payload, address = self.socket.recvfrom(65_535)
-        try:
-            packet = _decode_packet(payload)
-            if packet["seq"] >= self.last_sequence:
-                packet["lanes"] = self.smoother.update(
-                    packet["lanes"], packet.get("lane_ids")
-                )
-                self.latest = packet
-                self.latest_received = time.monotonic()
-                self.last_sequence = packet["seq"]
-        except (PacketError, ValueError, TypeError):
+        """쌓인 패킷을 전부 꺼내 가장 최근 것만 쓴다. 없으면 timeout 만큼 기다린다."""
+        packet, skipped, invalid, address = receive_latest(
+            self.socket, timeout, self.last_sequence
+        )
+        self.skipped += skipped
+        for _ in range(invalid):
             self.dropped += 1
             if self.dropped % 30 == 1:
                 print(f"ignored invalid packet from {address}")
+        if packet is None:
+            return
+        packet["lanes"] = self.smoother.update(packet["lanes"], packet.get("lane_ids"))
+        self.latest = packet
+        self.latest_received = time.monotonic()
+        self.last_sequence = packet["seq"]
 
     def frame(self, now: float) -> dict[str, Any]:
         """이번 프레임에 그릴 것. elapsed 를 뺀 render() 키워드 인자다."""
@@ -924,11 +944,26 @@ class LaneFeed:
             # 송신기가 재시작해 seq 가 0 으로 돌아와도 다시 받아들인다.
             self.last_sequence = -1
             self.smoother.reset()
+            # 송신기가 바뀌었을 수 있으니 시계 기준선도 다시 잡는다
+            self.lag_floor_ms = None
+
+        # 렌더 시각 - 송신 시각
+        self.lag_ms = None
+        if latest is not None and "sent_at" in latest:
+            self.lag_ms = (time.time() - float(latest["sent_at"])) * 1000.0
+            if self.lag_floor_ms is None or self.lag_ms < self.lag_floor_ms:
+                self.lag_floor_ms = self.lag_ms
+        queue_ms = None
+        if self.lag_ms is not None and self.lag_floor_ms is not None:
+            queue_ms = self.lag_ms - self.lag_floor_ms
 
         warning = "none"
         telemetry: dict[str, Any] = {}
         info = _blank_debug(
-            status="timeout", dropped=self.dropped, age_ms=min(age, 9.999) * 1000.0
+            status="timeout",
+            dropped=self.dropped,
+            skipped=self.skipped,
+            age_ms=min(age, 9.999) * 1000.0,
         )
         if latest is not None and not status.link_lost:
             warning = str(latest.get("warning", "none"))
@@ -951,6 +986,9 @@ class LaneFeed:
                 inference_ms=latest["inference_ms"],
                 age_ms=age * 1000.0,
                 dropped=self.dropped,
+                skipped=self.skipped,
+                lag_ms=self.lag_ms,
+                queue_ms=queue_ms,
                 warning=warning,
             )
         # 페이드가 남아 있는 동안은 마지막으로 받은 좌표를 그대로 어둡게
@@ -970,6 +1008,52 @@ class LaneFeed:
         )
 
 
+class _LatencyStats:
+    """receive --stats. 2초마다 지연 요약을 한 줄씩 찍는다.
+
+    고치기 전후, 설정을 바꾸기 전후를 숫자로 비교하려는 용도다. LAG 는 젯슨
+    시계와의 차이가 섞인 원값이라 절대값보다 추세를 본다. Q 는 최솟값을 뺀
+    값이라 계속 커지면 패킷이 밀리고 있다는 뜻이다.
+    """
+
+    def __init__(self, feed: "LaneFeed", interval: float = 2.0) -> None:
+        self.feed = feed
+        self.interval = interval
+        self.started = time.monotonic()
+        self.window = self.started
+        self.frames = 0
+        self.lags: list[float] = []
+        self.queues: list[float] = []
+        self.skipped = feed.skipped
+        print("  t[s]   fps  lag_avg  lag_max  q_avg  q_max  skip/s  seq")
+
+    def add(self, now: float, info: dict[str, Any]) -> None:
+        self.frames += 1
+        if info.get("lag_ms") is not None:
+            self.lags.append(float(info["lag_ms"]))
+            self.queues.append(float(info["queue_ms"]))
+        span = now - self.window
+        if span < self.interval:
+            return
+        skip_rate = (self.feed.skipped - self.skipped) / span
+        if self.lags:
+            print(
+                f"{now - self.started:6.1f} {self.frames / span:5.1f} "
+                f"{sum(self.lags) / len(self.lags):8.1f} {max(self.lags):8.1f} "
+                f"{sum(self.queues) / len(self.queues):6.1f} {max(self.queues):6.1f} "
+                f"{skip_rate:7.1f}  {info.get('seq', 0)}",
+                flush=True,
+            )
+        else:
+            print(f"{now - self.started:6.1f} {self.frames / span:5.1f}  no packets",
+                  flush=True)
+        self.window = now
+        self.frames = 0
+        self.lags = []
+        self.queues = []
+        self.skipped = self.feed.skipped
+
+
 def run_receive(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     ensure_ui_config(config)
@@ -986,12 +1070,18 @@ def run_receive(args: argparse.Namespace) -> None:
     print(f"HUD listening on {bind_host}:{port} / {renderer.width}x{renderer.height}")
 
     started = time.monotonic()
+    stats = _LatencyStats(feed) if args.stats else None
 
     try:
         while True:
             feed.poll(0.01)
             now = time.monotonic()
-            canvas = renderer.render(elapsed=now - started, **feed.frame(now))
+            frame_args = feed.frame(now)
+            if renderer.ui["debug"]["enabled"]:
+                frame_args["debug"]["show"] = True
+            canvas = renderer.render(elapsed=now - started, **frame_args)
+            if stats is not None:
+                stats.add(now, frame_args["debug"])
 
             cv2.imshow(name, canvas)
             key = cv2.waitKey(1) & 0xFF
@@ -1075,6 +1165,8 @@ def build_parser() -> argparse.ArgumentParser:
     receive.add_argument("--port", type=int)
     receive.add_argument("--windowed", action="store_true")
     receive.add_argument("--theme", action="store_true", help="AR 오버레이 시안으로")
+    receive.add_argument("--stats", action="store_true",
+                         help="2초마다 지연(젯슨 ts 기준)과 버린 패킷 수를 출력")
 
     bench = subparsers.add_parser("bench", help="이 장치에서 렌더 속도 측정")
     bench.add_argument("--config", type=Path, default=Path("hud_config.json"))

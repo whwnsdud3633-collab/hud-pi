@@ -380,9 +380,21 @@ class ThemeRenderer:
 
         frame = self._compose()
         if debug is not None and debug.get("show"):
-            cv2.putText(frame, "ALIGN {}  FPS {:.1f}  SEQ {}  STATE {}".format(
+            text_scale = 0.45 * self.scale + 0.2
+            lines = ["ALIGN {}  FPS {:.1f}  SEQ {}  STATE {}".format(
                 "cal" if self.calibrated else "uncal",
-                float(debug.get("fps", 0.0)), debug.get("seq", 0), self.state),
-                (12, self.height - 12), cv2.FONT_HERSHEY_SIMPLEX,
-                0.45 * self.scale + 0.2, (120, 120, 120), 1, cv2.LINE_AA)
+                float(debug.get("fps", 0.0)), debug.get("seq", 0), self.state)]
+            if "skipped" in debug:
+                # 수신 지연. 젯슨 ts 대비 LAG, 최솟값 대비 Q, 버린 패킷 수
+                lag = debug.get("lag_ms")
+                queue = debug.get("queue_ms")
+                lines.append("LAG {}  Q {}  SKIP {}  BAD {}".format(
+                    "--" if lag is None else f"{lag:.0f}ms",
+                    "--" if queue is None else f"{queue:.0f}ms",
+                    debug.get("skipped", 0), debug.get("dropped", 0)))
+            line_h = int(28 * text_scale) + 6
+            for index, line in enumerate(reversed(lines)):
+                cv2.putText(frame, line, (12, self.height - 12 - index * line_h),
+                            cv2.FONT_HERSHEY_SIMPLEX, text_scale, (120, 120, 120),
+                            1, cv2.LINE_AA)
         return frame
