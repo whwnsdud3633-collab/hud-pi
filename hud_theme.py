@@ -259,6 +259,82 @@ class ThemeRenderer:
             return None
         return np.rint(np.asarray(inside, dtype=np.float64)).astype(np.int32)
 
+    def _edge_width(self, side: str, departure_side: str | None) -> int:
+        """차선 한쪽을 그릴 굵기. 이탈 쪽은 굵게, 반대쪽은 가늘게."""
+        if departure_side is None:
+            key = "edge_width_ratio"
+        elif side == departure_side:
+            key = "alert_edge_width_ratio"
+        else:
+            key = "dim_edge_width_ratio"
+        return self._ratio_px(self.theme[key])
+
+    @staticmethod
+    def _cut_far(points: np.ndarray, s: np.ndarray, s_cut: float) -> np.ndarray | None:
+        """근거리부터 따라가다 진행 좌표 s 가 s_cut 을 넘는 자리에서 자른다.
+
+        넘는 선분에는 교점을 끼워 넣어 선이 정확히 s_cut 에서 끝나게 한다.
+        """
+        keep = [points[0].astype(np.float64)]
+        for index in range(1, len(points)):
+            if s[index] <= s_cut:
+                keep.append(points[index].astype(np.float64))
+                continue
+            if s[index - 1] < s_cut:
+                t = (s_cut - s[index - 1]) / (s[index] - s[index - 1])
+                keep.append(points[index - 1] + t * (points[index] - points[index - 1]))
+            break
+        if len(keep) < 2:
+            return None
+        return np.rint(np.asarray(keep)).astype(np.int32)
+
+    def _trim_far_contact(
+        self, left: np.ndarray, right: np.ndarray, min_gap: float
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """좌우 차선이 원거리에서 붙거나 교차하는 끝을 잘라 낸다.
+
+        젯슨은 두 차선을 따로 2차 피팅하고 y 구간 하나를 같이 보낸다. 그래서
+        소실점 부근에서 두 포물선이 몇 픽셀씩 겹쳐 X 자로 교차한다. 실측
+        캡처에서 교차는 전부 y_range 맨 위 끝에서만 났다. 와이어 포맷은 그대로
+        두고 그리는 쪽에서 정리한다.
+
+        같은 패널 행에서 두 선의 중심 간격이 min_gap (그릴 선 굵기) 보다
+        좁아지면 획이 맞닿는다. 근거리부터 따라가 처음 좁아지는 행에서 두
+        차선을 함께 자른다. 근거리에서부터 이미 붙어 있으면 원거리 수렴이
+        아니라 인식이 엉킨 것이므로 손대지 않는다.
+        """
+        # 진행 좌표 s: 근거리 -> 원거리로 커지는 패널 y. 반전이면 y 가
+        # 줄어드는 쪽이 원거리라 부호를 뒤집는다.
+        direction = 1.0 if left[-1][1] >= left[0][1] else -1.0
+        s_left = direction * left[:, 1].astype(np.float64)
+        s_right = direction * right[:, 1].astype(np.float64)
+        # 꼭짓점이 구간 안에 든 갈고리 차선은 s 가 되돌아올 수 있다.
+        # 간격 계산용으로만 단조 포락선을 쓴다.
+        mono_left = np.maximum.accumulate(s_left)
+        mono_right = np.maximum.accumulate(s_right)
+        low = max(mono_left[0], mono_right[0])
+        high = min(mono_left[-1], mono_right[-1])
+        if high - low < 2.0:
+            return left, right
+        rows = np.linspace(low, high, max(2, int(high - low) // 4 + 1))
+        # 근거리 끝 x 로 어느 쪽이 오른쪽인지 정한다. flip_horizontal 이면
+        # 패널에서 좌우가 바뀌어 있다.
+        side = 1.0 if right[0][0] >= left[0][0] else -1.0
+        gap = side * (
+            np.interp(rows, mono_right, right[:, 0].astype(np.float64))
+            - np.interp(rows, mono_left, left[:, 0].astype(np.float64))
+        )
+        if gap[0] < min_gap:
+            return left, right
+        close = np.flatnonzero(gap < min_gap)
+        if len(close) == 0:
+            return left, right
+        k = int(close[0])
+        t = (gap[k - 1] - min_gap) / (gap[k - 1] - gap[k])
+        s_cut = rows[k - 1] + t * (rows[k] - rows[k - 1])
+        return (self._cut_far(left, s_left, s_cut),
+                self._cut_far(right, s_right, s_cut))
+
     def _draw_ribbon(
         self,
         left: np.ndarray | None,
@@ -300,12 +376,7 @@ class ThemeRenderer:
                     continue
             mask = self._clear_mask()
             departing = alert and side == departure_side
-            if departing:
-                width = self._ratio_px(self.theme["alert_edge_width_ratio"])
-            elif alert:
-                width = self._ratio_px(self.theme["dim_edge_width_ratio"])
-            else:
-                width = self._ratio_px(self.theme["edge_width_ratio"])
+            width = self._edge_width(side, departure_side)
             cv2.polylines(mask, [reveal], False, 255, width, cv2.LINE_AA)
             if departing:
                 on = phase < 0.5                     # steps(1, end)
@@ -411,6 +482,11 @@ class ThemeRenderer:
                     left = single
                 else:
                     right = single
+            if left is not None and right is not None:
+                # 두 획이 맞닿는 간격은 굵은 쪽 선 굵기다
+                min_gap = max(self._edge_width("left", departure_side),
+                              self._edge_width("right", departure_side))
+                left, right = self._trim_far_contact(left, right, min_gap)
 
             self._draw_ribbon(left, right, departure_side, elapsed,
                               self.lane_state, boot, self.lane_opacity)
