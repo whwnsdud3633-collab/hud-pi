@@ -4,7 +4,7 @@
 이 저장소는 **파이 쪽(수신 + 렌더링)** 만 담당한다.
 
 ```
-카메라 → Jetson Orin Nano (추론) → UDP → [ Raspberry Pi 5 ] → Touch Display 2 → 반사 패널 → 윈드실드
+카메라 → Jetson Orin Nano (추론) → UDP → [ Raspberry Pi 5 ] → ASUS MQ16FC (HDMI) → 반사 패널 → 윈드실드
                                             이 저장소
 ```
 
@@ -17,8 +17,8 @@
 | 보드 | Raspberry Pi 5, RAM 8GB, Active Cooler, 27W 전원 |
 | OS | Raspberry Pi OS 64-bit, Debian 13 Trixie, 커널 6.18 aarch64 |
 | 데스크톱 | **labwc (Wayland)**. X11 아님 |
-| 디스플레이 | Raspberry Pi Touch Display 2, DSI 연결, 출력 이름 `DSI-1` |
-| 패널 해상도 | **1280×720** (패널 원본은 720×1280 세로, labwc가 `--transform 90`으로 회전) |
+| 디스플레이 | ASUS MQ16FC 16인치, HDMI 연결, 출력 이름 `HDMI-A-2` |
+| 패널 해상도 | **1920×1200** (16:10, 네이티브 가로. 회전 불필요) |
 | OpenCV | 4.10.0, **apt 설치본** (`python3-opencv`) |
 | 사용자 | `visionajou`, 홈 `/home/visionajou`, 코드 `~/hud` |
 | 네트워크 | 폰 핫스팟(개발용) `wlan0` + 젯슨 직결 이더넷 `eth0` |
@@ -29,7 +29,7 @@
 - **`pip install opencv-python` 금지.** 소스 빌드로 들어가 한 시간 이상 걸리고 자주 실패한다. apt 패키지를 쓴다.
 - **`RPi.GPIO` 사용 금지.** Pi 5는 RP1 I/O 칩을 거치므로 동작하지 않는다. `gpiozero` + `lgpio`를 쓴다.
 - **`xset`, `lcd_rotate`, `display_rotate` 사용 금지.** Wayland라 전부 무효다. 화면 설정은 `wlr-randr` 또는 `raspi-config`.
-- 화면 회전은 `~/.config/labwc/autostart`에 이미 설정되어 있다. 코드에서 다시 회전하지 말 것.
+- 패널이 네이티브 가로라 화면 회전은 필요 없다. 코드나 컴포지터 설정에서 회전을 넣지 말 것.
 - 추가 파이썬 패키지가 필요하면 `apt`를 우선하고, 불가피하면 `python3 -m venv --system-site-packages`.
 
 ---
@@ -40,7 +40,8 @@
 
 1. **배경은 순수 검정(0,0,0)이어야 한다.** 반사 광학계에서 검정 = 투명이다. 어두운 회색 배경이나 그라디언트 배경을 깔면 윈드실드에 회색 사각형이 그대로 떠서 운전자 시야를 가린다.
 2. **큰 면적의 밝은 요소를 피한다.** 선과 글리프 위주로 그린다.
-3. **좌우 반전이 필요하다.** 패널 → 반사판 → 눈 경로에서 상이 뒤집힌다. `display.flip_horizontal` 설정으로 제어한다.
+3. **소프트웨어는 상하 반전만 한다.** 반사판이 좌우를 뒤집으므로 좌우는 광학계가 담당한다. 실물 배치 기준 실측값은 `display.flip_horizontal: false`, `display.flip_vertical: true` 다.
+   ("컴바이너가 X축 기준이라 상하만 뒤집힌다" 는 이전 가정과 반대였다. 배치를 바꾸면 다시 실측할 것)
 4. **합성은 알파가 아니라 가산(additive)이다.** 발광 디스플레이라 겹치는 빛이 밝아진다. 실제 광학 동작과도 맞고 더 빠르다.
 5. 밝기는 최대로 둔다 (`/sys/class/backlight/`).
 
@@ -76,8 +77,9 @@
 ## 좌표계
 
 - 디자인 좌표: `960×540` (`hud_theme.DESIGN_W/H`)
-- 패널 좌표: `1280×720`
-- 둘 다 16:9라 `scale = 1.3333`, `offset_x = offset_y = 0`. **레터박스가 생기지 않는다.**
+- 패널 좌표: `1920×1200` (16:10)
+- 디자인은 16:9, 패널은 16:10이라 `scale = 2.0` (가로 기준), `offset_x = 0`, `offset_y = 60`.
+  **위아래로 60px씩 레터박스가 생긴다.** 실제 그림 영역은 `1920×1080`. 레터박스는 순수 검정으로 둔다
 - 차선 폴리라인은 정규화 좌표로 수신 → `AlignmentMap.project()`로 패널 픽셀 변환
 
 ---
@@ -113,7 +115,7 @@ points = points[inside]     # 또 소실
 현재 `cv2.imshow` + `waitKey`. Wayland에서는 XWayland를 경유해 지연이 붙는다.
 
 - 대안 A: `raspi-config`로 X11 전환
-- 대안 B: pygame KMSDRM (`SDL_VIDEODRIVER=kmsdrm`) — 지연 최소지만 **컴포지터를 거치지 않으므로 패널이 720×1280 세로로 나온다.** 소프트웨어 회전 비용을 감안해야 함
+- 대안 B: pygame KMSDRM (`SDL_VIDEODRIVER=kmsdrm`) — 컴포지터를 거치지 않아 지연이 최소. 패널이 네이티브 가로라 소프트웨어 회전 비용은 없다
 
 실측 후 결정한다. 어느 쪽이든 `hud_theme`의 그리기 함수는 건드리지 않도록 출력 계층을 분리해 둘 것.
 
