@@ -14,9 +14,9 @@
 그린다.
 
 인식 상태 state(0 정상 / 1 주의 / 2 인식 불가)는 두 군데에 나타난다.
-화면 맨 아래를 가로지르는 얇은 상태 바는 state 색 한 가지로 항상 그린다.
-state 2 에서도 그린다. 차선에서 state 는 색만 정한다. 0 은 녹색, 1 은
-노란색, 2 는 아예 그리지 않는다. 0 과 1 은 색만 다르고 굵기·모양·밝기가
+화면 아래쪽, 가장자리에서 state_bar_margin_ratio 만큼 안쪽을 가로지르는
+얇은 상태 바는 state 색 한 가지로 항상 그린다. state 2 에서도 그린다.
+차선에서 state 는 색만 정한다. 0 은 녹색, 1 은 노란색, 2 는 아예 그리지 않는다. 0 과 1 은 색만 다르고 굵기·모양·밝기가
 완전히 같다. 차선 색은 상태 바와 같은 STATE_COLORS 를 쓴다. 차선 이탈 경고도 색에 관여하지 않고 굵기와
 점멸만 바꾼다.
 
@@ -103,6 +103,11 @@ class ThemeRenderer:
         # 1920x1200 에서 0.005 -> 6px.
         theme.setdefault("state_bar", True)
         theme.setdefault("state_bar_height_ratio", 0.005)
+        # 상태 바를 운전자 기준 아랫면에서 이만큼 안쪽으로 띄운다. 화면 높이
+        # 비율. 반사판은 패널 가장자리를 잘 못 비춰서 끝에 붙이면 시선을
+        # 한참 내려야 보인다. 1920x1200 에서 0.03 -> 36px. pattern 의
+        # SAFE 사각형이 같은 값이다.
+        theme.setdefault("state_bar_margin_ratio", 0.03)
         self.theme = theme
         # hud_ui 의 preview / sample 과 인터페이스를 맞추기 위한 최소 항목
         self.ui = config.setdefault("ui", {})
@@ -288,19 +293,27 @@ class ThemeRenderer:
 
     # 상태 바 ----------------------------------------------------------
 
+    @property
+    def safe_margin_px(self) -> int:
+        """안전 영역 여백. 패널 네 변에서 같은 픽셀만큼 들어간다."""
+        ratio = max(0.0, float(self.theme["state_bar_margin_ratio"]))
+        return min(int(round(ratio * self.height)), self.height // 2)
+
     def _build_state_bar(self) -> None:
         """상태 바가 차지할 행 범위를 미리 정해 둔다.
 
-        운전자가 보는 화면의 아랫면에 붙인다. flip_vertical 이 켜져 있으면
-        패널 윗줄이 운전자에게는 아랫면이므로 위쪽 행을 쓴다. 좌우 반전은
-        화면 폭 전체를 채우는 선이라 상관없다.
+        운전자가 보는 화면의 아랫면에서 safe_margin_px 만큼 안쪽에 둔다.
+        flip_vertical 이 켜져 있으면 패널 윗줄이 운전자에게는 아랫면이므로
+        여백도 패널 위쪽에서 잰다. 좌우 반전은 화면 폭 전체를 채우는 선이라
+        상관없다.
         """
         rows = self._ratio_px(self.theme["state_bar_height_ratio"])
         rows = min(rows, self.height)
+        margin = min(self.safe_margin_px, self.height - rows)
         if self.mapper.physical_flip_vertical:
-            self._state_bar_rows = (0, rows)
+            self._state_bar_rows = (margin, margin + rows)
         else:
-            self._state_bar_rows = (self.height - rows, self.height)
+            self._state_bar_rows = (self.height - margin - rows, self.height - margin)
 
     def _draw_state_bar(self) -> None:
         """화면 폭 전체에 state 색 선 한 줄을 더한다.

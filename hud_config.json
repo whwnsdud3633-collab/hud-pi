@@ -84,6 +84,7 @@
     "dim_edge_width_ratio": 0.0111,
     "boot_animation": true,
     "state_bar": true,
-    "state_bar_height_ratio": 0.005
+    "state_bar_height_ratio": 0.005,
+    "state_bar_margin_ratio": 0.03
   }
 }
