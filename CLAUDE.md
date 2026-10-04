@@ -51,7 +51,7 @@
 
 | 파일 | 상태 |
 |---|---|
-| `hud_theme.py` | 시안 2a/2b 렌더러. 완성도 높음. 12ms/프레임까지 최적화됨 |
+| `hud_theme.py` | 시안 2a/2b 렌더러. 완성도 높음. 1920×1200 에서 약 22ms/프레임 (아래 bench 참조) |
 | `hud_ui.py` | 화면 구성, 경고 판정, preview/sample/receive/bench 서브커맨드. `LaneFeed` (수신→스무딩→상태 계층) 는 receive 와 trim 이 같이 쓴다 |
 | `hud_system.py` | 패킷 수신·파싱(`_decode_packet`, 젯슨 어댑터), `LaneSmoother`, `_select_hud_lanes`, `_mock_lane`, `HudSender`, config 입출력 |
 | `hud_align.py` | 운전자 시점 정렬. `AlignmentMap.project()`, 미세 보정 `TrimParams`, 보정 CLI (`preset`/`eyebox`/`profile`/`place`/`pick`/`aim`/`verify`/`trim`) |
@@ -239,7 +239,17 @@ points[:, 1] += trim_dy * (1.0 - D_VI / depths)
   - `cv2.boundingRect(mask)`로 실제 칠할 영역만 처리
   - 글로우는 축소 → 블러 → 확대
   - 글자 마스크는 `lru_cache`
-- 위 최적화를 "가독성을 위해" 되돌리지 말 것. 12ms/프레임의 핵심이다
+- 위 최적화를 "가독성을 위해" 되돌리지 말 것. 렌더 속도의 핵심이다
+
+### bench 실측 (2026-10-04, `python3 hud_ui.py bench --theme --frames 300`)
+
+| 해상도 | 차선 그림 (state 0/1, 페이드) | 차선 없음 (state 2) |
+|---|---|---|
+| 1280×720 | 9.2 ms (109 fps) | 5.2 ms |
+| **1920×1200** | **22.3~22.6 ms (44 fps)** | 12.7 ms |
+
+픽셀 수(2.5배)에 거의 비례해 늘었다. **현재 해상도로는 60fps(16.7ms) 안에 안 들어온다.** 30fps(33ms)는 충족.
+이전 문서의 12ms 는 1280×720 시절 값이다
 
 ---
 
