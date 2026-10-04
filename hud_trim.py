@@ -39,6 +39,7 @@ from hud_system import _mock_lane, load_config, save_config
 
 MOVE, KEYSTONE, ROLL = "move", "keystone", "roll"
 RESET, SAVE, QUIT, TOGGLE_STEP, SET = "reset", "save", "quit", "toggle_step", "set"
+SAVE_QUIT = "save_quit"
 OTHER = "other"     # 뜻 없는 입력. 종료 확인을 취소하는 데만 쓰인다
 
 
@@ -49,6 +50,7 @@ class TrimCommand:
     move      dx, dy 는 -1/0/+1 방향. +x 오른쪽, +y 아래
     keystone  sign +1 이면 위쪽 폭이 넓어진다
     roll      sign +1 이면 시계 방향 (오른쪽이 내려감)
+    save_quit 저장하고 종료. 바뀐 게 있으면 한 번 더 확인한다
     set       value 로 값을 통째로 바꾼다. 절대값을 주는 소스용
     other     그 밖의 입력. 값은 안 바꾸고 종료 확인만 취소한다
     coarse    None 이면 지금 선택된 폭, True/False 면 이번 한 번만 그 폭
@@ -82,8 +84,10 @@ class TrimAdjuster:
         changed        값이 바뀌었다
         step           큰 폭/작은 폭이 바뀌었다
         saved          저장했다
+        confirm_save   바뀐 채 저장 후 종료를 눌러 한 번 더 누르길 기다린다
         confirm_quit   저장 안 한 채 종료하려 해서 확인을 기다린다
         cancel         확인 대기 중에 다른 명령이 와서 종료를 취소했다
+                       (확인을 취소한 명령 자체는 실행하지 않는다)
         quit           종료
         none           아무 일도 없었다
     """
@@ -103,6 +107,7 @@ class TrimAdjuster:
         self.width, self.height = width, height
         self.coarse = False
         self.confirming_quit = False
+        self.confirming_save = False
         self._on_change = on_change
         self._on_save = on_save
 
@@ -140,7 +145,21 @@ class TrimAdjuster:
                 self._save()
                 return "quit"
             return "cancel"
+        if self.confirming_save:
+            # 바뀐 채 저장 후 종료를 눌렀다. 같은 명령이 한 번 더 오면 저장하고
+            # 종료, 그 밖의 명령은 취소한다. 키패드 5 가 방향키 한가운데라
+            # 맞추다가 잘못 눌러 반쯤 맞춘 값이 저장되는 것을 막는다.
+            self.confirming_save = False
+            if action == SAVE_QUIT:
+                self._save()
+                return "quit"
+            return "cancel"
 
+        if action == SAVE_QUIT:
+            if self.dirty:
+                self.confirming_save = True
+                return "confirm_save"
+            return "quit"
         if action == QUIT:
             if self.dirty:
                 self.confirming_quit = True
@@ -187,14 +206,18 @@ ARROW_DOWN = (65364, 2621440)
 
 # 숫자 키패드. 운전석에서 한 손으로 쓰라고 둔 배치다.
 #
-#     7 위 좁게   8 위      9 위 넓게
-#     4 왼쪽      5 리셋    6 오른쪽
+#     7 위 좁게   8 위      9 위 넓게    * 리셋
+#     4 왼쪽      5 저장 후 종료  6 오른쪽
 #     1 반시계    2 아래    3 시계
 #     0 큰 폭/작은 폭        Enter, + 저장
 #
+# 5 는 게임패드 확인 버튼처럼 쓰라고 방향키 가운데에 뒀다. 바뀐 값이 있으면
+# 한 번 더 눌러야 저장된다 (TrimAdjuster 참조).
+#
 # Num Lock 이 켜져 있으면 Qt 가 일반 숫자와 같은 '0'~'9' 로 준다. 꺼져 있으면
-# 키패드 전용 X keysym (KP_Home 등) 이 온다. 둘 다 받는다. 키패드 Enter 는
-# Num Lock 과 상관없이 KP_Enter, + 는 '+' 로 온다.
+# 키패드 전용 X keysym (KP_Home 등) 이 온다. 둘 다 받는다. * 와 + 는
+# Num Lock 과 상관없이 '*', '+' 로 온다. 키패드 Enter 는 이 파이에서 일반
+# Enter 와 같은 13 으로 왔지만 KP_Enter 로 주는 환경도 있어 같이 받는다.
 KP_HOME, KP_LEFT, KP_UP, KP_RIGHT, KP_DOWN = 65429, 65430, 65431, 65432, 65433
 KP_PRIOR, KP_NEXT, KP_END, KP_BEGIN, KP_INSERT = 65434, 65435, 65436, 65437, 65438
 KP_ENTER = 65421
@@ -209,7 +232,8 @@ KEYPAD = {
     (ord("9"), KP_PRIOR): TrimCommand(KEYSTONE, sign=1),   # w 와 같음
     (ord("1"), KP_END): TrimCommand(ROLL, sign=-1),        # a 와 같음
     (ord("3"), KP_NEXT): TrimCommand(ROLL, sign=1),        # d 와 같음
-    (ord("5"), KP_BEGIN): TrimCommand(RESET),
+    (ord("5"), KP_BEGIN): TrimCommand(SAVE_QUIT),
+    (ord("*"),): TrimCommand(RESET),
     (ord("0"), KP_INSERT): TrimCommand(TOGGLE_STEP),
     (KP_ENTER, ord("+"), KP_ADD): TrimCommand(SAVE),
 }
@@ -220,6 +244,8 @@ KEY_TAB = 9
 # Shift, Ctrl, Caps Lock, Alt, Super 를 단독으로 누른 것. 종료 확인 중에
 # 이것만으로 취소되면 곤란하므로 무시한다.
 MODIFIER_KEYS = range(65505, 65519)
+# Num Lock 자체도 키로 온다. 키패드 쓰다가 켜고 끄는 것으로 확인이 취소되면 안 된다
+KEY_NUM_LOCK = 65407
 
 
 def key_to_command(key: int) -> TrimCommand | None:
@@ -259,7 +285,7 @@ def key_to_command(key: int) -> TrimCommand | None:
     if 0 <= key < 256 and chr(key).lower() in letters:
         action, sign = letters[chr(key).lower()]
         return TrimCommand(action, sign=sign)
-    if key in MODIFIER_KEYS:
+    if key in MODIFIER_KEYS or key == KEY_NUM_LOCK:
         return None
     return TrimCommand(OTHER)
 
@@ -377,15 +403,16 @@ def run_trim(args: argparse.Namespace) -> None:
     _open_window(name, renderer, args.windowed, bool(display["fullscreen"]))
     print("arrows move, w/s keystone, a/d roll, f or tab coarse/fine,")
     print("enter save, q quit")
-    print("keypad: 8/2/4/6 move, 7/9 keystone, 1/3 roll, 5 reset, 0 step, enter or + save")
+    print("keypad: 8/2/4/6 move, 7/9 keystone, 1/3 roll, * reset, 0 step,")
+    print("        enter or + save, 5 save and quit")
     print(_describe(adjuster))
 
     mirror = mapper.physical_flip_horizontal
     help_lines = [
         "arrows move  w/s keystone  a/d roll  f step  enter save  q quit",
-        "keypad  7 key-  8 up    9 key+",
-        "        4 left  5 reset 6 right     0 step",
-        "        1 roll- 2 down  3 roll+     enter/+ save",
+        "keypad  7 key-  8 up    9 key+      * reset",
+        "        4 left  5 done  6 right     0 step",
+        "        1 roll- 2 down  3 roll+     enter/+ save  (5 done = save+quit)",
     ]
     overlay_key: tuple[Any, ...] | None = None
     overlay = None
@@ -400,13 +427,17 @@ def run_trim(args: argparse.Namespace) -> None:
 
             debug = frame_args.get("debug") or {}
             rx = "RX timeout" if debug.get("status") == "timeout" else f"{source_label} ok"
-            key_state = (_describe(adjuster), adjuster.confirming_quit, rx)
+            key_state = (_describe(adjuster), adjuster.confirming_quit,
+                         adjuster.confirming_save, rx)
             if key_state != overlay_key:
                 overlay_key = key_state
                 lines = [(key_state[0] + "   " + rx, OVERLAY_COLOR)]
                 lines += [(line, OVERLAY_COLOR) for line in help_lines]
                 if adjuster.confirming_quit:
                     lines.append(("UNSAVED. enter: save+quit  q: discard+quit  other: cancel",
+                                  CONFIRM_COLOR))
+                if adjuster.confirming_save:
+                    lines.append(("SAVE AND QUIT? 5 again: yes  other: cancel",
                                   CONFIRM_COLOR))
                 overlay = _overlay(mapper.width, mapper.height, lines, mirror)
             cv2.add(canvas, overlay, dst=canvas)
@@ -422,8 +453,10 @@ def run_trim(args: argparse.Namespace) -> None:
                     elif event == "confirm_quit":
                         print("unsaved changes. enter: save and quit, "
                               "q: quit without saving, any other key: cancel")
+                    elif event == "confirm_save":
+                        print("save and quit? 5 again: yes, any other key: cancel")
                     elif event == "cancel":
-                        print("quit cancelled")
+                        print("cancelled")
                     elif event == "quit":
                         done = True
                         break
