@@ -647,6 +647,8 @@ def run_sample(args: argparse.Namespace) -> None:
 #   벌어진 만큼이 레터박스다. 16:10 패널이면 위아래로 벌어진다.
 #   L/R/TOP/BOTTOM 글자와 좌상 → 우하 대각선이 비대칭 기준이다. 글자가
 #   거울상이면 그 축으로 반전이 걸려 있다.
+#   자홍색 사각형이 안전 영역이다. 반사판 앞 운전 자세에서 네 변이 다
+#   보여야 하고, 그 안쪽 녹색 띠가 상태 바가 실제로 그려지는 자리다.
 
 PATTERN_GRID_PX = 100
 
@@ -660,6 +662,7 @@ PATTERN_COLORS = {
     "cross": (120, 255, 120),      # 녹색     중심 십자
     "label": (255, 255, 255),      # 흰색     방향 글자
     "info": (0, 170, 255),         # 주황색   반전을 타지 않는 안내 블록
+    "safe": (255, 0, 255),         # 자홍색   안전 영역 경계
 }
 
 
@@ -780,6 +783,27 @@ def _draw_pattern_frame(renderer: ThemeRenderer, canvas: np.ndarray) -> None:
     cv2.rectangle(canvas, (0, 0), (width - 1, height - 1),
                   PATTERN_COLORS["border"], 1)
 
+    # 7. 안전 영역. 네 변에서 같은 여백이라 반전과 무관하게 제자리다.
+    #    반사판 앞에서 운전 자세로 이 사각형 네 변이 다 보이는지 본다.
+    #    아랫변이 안 보이면 theme.state_bar_margin_ratio 를 키운다.
+    margin = renderer.safe_margin_px
+    safe = PATTERN_COLORS["safe"]
+    if margin > 0:
+        cv2.rectangle(canvas, (margin, margin),
+                      (width - 1 - margin, height - 1 - margin), safe, 2)
+
+    # 8. 상태 바 실제 위치. 렌더러가 쓰는 행 범위를 그대로 칠한다.
+    #    상태 바는 물리적 반전을 따르고 패턴 본체는 행렬에 남은 반전을
+    #    따르므로, 본체에 그리면 대응쌍 보정 모드에서 자리가 어긋난다.
+    bar_top, bar_bottom = renderer._state_bar_rows
+    canvas[bar_top:bar_bottom] = STATE_COLORS[STATE_NORMAL]
+    # 글자는 바에서 안전 영역 안쪽으로 띄운다. 가운데는 TOP/BOTTOM
+    # 글자 자리라 왼쪽에 둔다.
+    label_y = (bar_bottom + 22 * scale if bar_top < height / 2
+               else bar_top - 22 * scale)
+    _pattern_text(canvas, f"STATE BAR  safe margin {margin}px",
+                  (width * 0.2, label_y), 0.42 * scale, safe, 2)
+
     # 설정값과 패턴이 실제로 탄 반전을 따로 적는다. 대응쌍 보정이 잡혀
     # 있으면 반전이 행렬에 흡수되어 둘이 갈라진다.
     def onoff(flag: bool) -> str:
@@ -798,6 +822,9 @@ def _draw_pattern_frame(renderer: ThemeRenderer, canvas: np.ndarray) -> None:
         f"    pattern rode  H {onoff(applied_flip[0])} V {onoff(applied_flip[1])}",
         f"ALIGN {'correspondence (flip absorbed in matrix)' if mapper.calibrated else 'quad (uncalibrated)'}",
         f"LANE WIDTH  {widths}",
+        f"SAFE margin {renderer.safe_margin_px}px"
+        f" (theme.state_bar_margin_ratio {float(renderer.theme['state_bar_margin_ratio']):.3f})"
+        f"   state bar rows {bar_top}-{bar_bottom - 1}",
         "mirrored L/R or TOP/BOTTOM above = that axis is flipped",
     ]
     # 패턴이 비워 둔 위쪽 띠. 굵기 샘플(0.38H 아래)과 TOP/BOTTOM 글자
