@@ -40,8 +40,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "fall_frames": 5,
     },
     "display": {
-        "width": 1280,
-        "height": 720,
+        "width": 1920,
+        "height": 1200,
         "fullscreen": True,
         "window_name": "Rain Lane HUD",
         "line_thickness": 8,

@@ -94,13 +94,13 @@ class ThemeRenderer:
 
         theme = config.setdefault("theme", {})
         # 굵기는 절대 픽셀이 아니라 화면 높이 비율로 둔다. 패널이 바뀌어도
-        # 눈에 보이는 굵기가 유지된다. 1280x720 에서 0.0148 -> 약 11px.
+        # 눈에 보이는 굵기가 유지된다. 1920x1200 에서 0.0148 -> 약 18px.
         theme.setdefault("edge_width_ratio", 0.0148)
         theme.setdefault("alert_edge_width_ratio", 0.0296)
         theme.setdefault("dim_edge_width_ratio", 0.0111)
         theme.setdefault("boot_animation", True)
         # 하단 상태 바. 굵기는 차선과 마찬가지로 화면 높이 비율이다.
-        # 1280x720 에서 0.005 -> 4px.
+        # 1920x1200 에서 0.005 -> 6px.
         theme.setdefault("state_bar", True)
         theme.setdefault("state_bar_height_ratio", 0.005)
         self.theme = theme

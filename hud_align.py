@@ -574,7 +574,7 @@ def run_pick(args: argparse.Namespace) -> None:
 
     name = "pick markers"
     cv2.namedWindow(name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(name, min(1280, width), min(720, height))
+    cv2.resizeWindow(name, min(1920, width), min(1200, height))
     cv2.setMouseCallback(name, on_mouse)
     print("click each ground marker, far ones first. u undo, s save, q quit")
 
