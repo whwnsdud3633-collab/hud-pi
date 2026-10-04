@@ -72,11 +72,18 @@ def normalize_state(value: Any) -> int:
     return state if state in LANE_STATES else STATE_NORMAL
 
 
-def _build_ramp(height: int, bottom_y: float, top_y: float, stops) -> np.ndarray:
-    """패널 행마다 알파 배수를 담은 세로 램프를 만든다."""
+def _build_ramp(height: int, near_y: float, far_y: float, stops) -> np.ndarray:
+    """패널 행마다 알파 배수를 담은 세로 램프를 만든다.
+
+    t 는 근거리 near_y 에서 0, 원거리 far_y 에서 1 이다. 상하 반전이 켜져
+    있으면 근거리가 패널 위쪽이라 near_y < far_y 가 된다. 어느 방향이든
+    부호가 span 에 실려 있어 같은 식으로 풀린다.
+    """
     rows = np.arange(height, dtype=np.float32)
-    span = max(1e-6, bottom_y - top_y)
-    t = np.clip((bottom_y - rows) / span, 0.0, 1.0)
+    span = far_y - near_y
+    if abs(span) < 1e-6:
+        span = 1e-6
+    t = np.clip((rows - near_y) / span, 0.0, 1.0)
     offsets = np.asarray([s[0] for s in stops], dtype=np.float32)
     values = np.asarray([s[1] for s in stops], dtype=np.float32)
     return np.interp(t, offsets, values).astype(np.float32)[:, None]
@@ -123,7 +130,10 @@ class ThemeRenderer:
 
         self._ramp_range = (-1.0, -1.0)
         self.ramps: dict[str, np.ndarray] = {}
-        self._update_ramps(self._dy(DESIGN_H), self._dy(HORIZON_Y))
+        near, far = self._dy(DESIGN_H), self._dy(HORIZON_Y)
+        if self.mapper.flip_vertical:
+            near, far = self.height - 1 - near, self.height - 1 - far
+        self._update_ramps(near, far)
         # 채널을 분리해 두면 합성이 훨씬 빠르다. 3채널 배열에 브로드캐스트로
         # 곱하는 것보다 1채널 연속 메모리 세 번이 6배 가까이 빠르다.
         self.planes = [np.zeros((self.height, self.width), np.float32) for _ in range(3)]
@@ -134,14 +144,18 @@ class ThemeRenderer:
         self.lane_opacity = 1.0
         self._build_state_bar()
 
-    def _update_ramps(self, bottom: float, top: float) -> None:
-        """원근 페이드를 리본이 실제로 차지한 세로 범위에 맞춘다."""
-        if abs(bottom - self._ramp_range[0]) < 2 and abs(top - self._ramp_range[1]) < 2:
+    def _update_ramps(self, near: float, far: float) -> None:
+        """원근 페이드를 리본이 실제로 차지한 세로 범위에 맞춘다.
+
+        near / far 는 근거리 끝과 원거리 끝의 패널 y 다. 패널 위아래가 아니라
+        원근 기준이라 상하 반전이 켜져 있어도 근거리가 밝다.
+        """
+        if abs(near - self._ramp_range[0]) < 2 and abs(far - self._ramp_range[1]) < 2:
             return
-        self._ramp_range = (bottom, top)
+        self._ramp_range = (near, far)
         for name, stops in (("edge", EDGE_STOPS), ("dim", DIM_STOPS),
                             ("alert_edge", ALERT_EDGE_STOPS)):
-            self.ramps[name] = _build_ramp(self.height, bottom, top, stops)
+            self.ramps[name] = _build_ramp(self.height, near, far, stops)
 
     @property
     def calibrated(self) -> bool:
@@ -221,7 +235,16 @@ class ThemeRenderer:
     # 차선 --------------------------------------------------------------
 
     def _project_lane(self, lane: Any) -> np.ndarray | None:
+        """차선을 패널 픽셀로. 점 순서는 근거리 -> 원거리다.
+
+        순서는 투영 전에 카메라 y 로 정한다. 카메라 영상에서는 아래(y 큰
+        쪽)가 항상 가까운 쪽이지만, 패널에서는 상하 반전이나 대응쌍 행렬이
+        위아래를 뒤집을 수 있어 패널 y 로는 원근을 알 수 없다. 예전처럼
+        투영 뒤 패널 y 로 정렬하면 flip_vertical 에서 원거리가 맨 앞에 와
+        페이드가 거꾸로 걸렸다. 아래 필터링은 전부 순서를 유지한다.
+        """
         clipped = self.mapper.clip_above_horizon(lane)
+        clipped = clipped[np.argsort(-clipped[:, 1], kind="stable")]
         points, valid = self.mapper.project(clipped)
         if valid.sum() < 2:
             return None
@@ -234,9 +257,7 @@ class ThemeRenderer:
         inside = _clip_polyline(points.astype(np.float64).tolist(), bounds)
         if len(inside) < 2:
             return None
-        points = np.rint(np.asarray(inside, dtype=np.float64)).astype(np.int32)
-        order = np.argsort(-points[:, 1])       # 아래에서 위로
-        return points[order]
+        return np.rint(np.asarray(inside, dtype=np.float64)).astype(np.int32)
 
     def _draw_ribbon(
         self,
@@ -255,10 +276,14 @@ class ThemeRenderer:
         color = STATE_COLORS[state]
         present = [p for p in (left, right) if p is not None]
         if present:
-            self._update_ramps(
-                float(max(p[0][1] for p in present)),
-                float(min(p[-1][1] for p in present)),
-            )
+            # 점 순서가 근거리 -> 원거리라 p[0] 이 근거리 끝이다. 차선 여럿을
+            # 다 덮도록 근거리는 가장 가까운 쪽, 원거리는 가장 먼 쪽을 고른다.
+            nears = [float(p[0][1]) for p in present]
+            fars = [float(p[-1][1]) for p in present]
+            if sum(nears) >= sum(fars):
+                self._update_ramps(max(nears), min(fars))
+            else:
+                self._update_ramps(min(nears), max(fars))
         phase = (elapsed % BLINK_PERIOD) / BLINK_PERIOD
 
         # 1. 경계선
