@@ -64,14 +64,14 @@
     },
     "trim_step": {
       "fine": {
-        "move_px": 1.0,
-        "keystone": 0.002,
-        "roll_deg": 0.05
+        "move_px": 3.0,
+        "keystone": 0.005,
+        "roll_deg": 0.1
       },
       "coarse": {
-        "move_px": 8.0,
-        "keystone": 0.01,
-        "roll_deg": 0.5
+        "move_px": 25.0,
+        "keystone": 0.025,
+        "roll_deg": 1.0
       }
     }
   },
