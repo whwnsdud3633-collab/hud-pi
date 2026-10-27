@@ -37,6 +37,19 @@ from hud_theme import (
     ThemeRenderer,
     normalize_state,
 )
+# receive 중 trim 조정은 trim 도구의 키 해석과 보정 로직을 그대로 쓴다
+from hud_trim import (
+    CONFIRM_COLOR,
+    KEY_DELETE,
+    OVERLAY_COLOR,
+    QUIT,
+    TrimAdjuster,
+    TrimCommand,
+    _describe,
+    _overlay,
+    key_to_command,
+    save_trim,
+)
 # 무수신 판정, 페이드, 디바운싱은 그리기 코드가 아니라 상태 계층이 맡는다
 from hud_state import StateTracker, ensure_state_config
 from hud_system import (
@@ -1081,6 +1094,100 @@ class _LatencyStats:
         self.skipped = self.feed.skipped
 
 
+class _ReceiveTrim:
+    """receive 실행 중 Del 로 켜는 trim 조정 모드.
+
+    꺼져 있을 때는 Del 말고는 아무 키도 가로채지 않는다. 켜지면 모든 키를
+    hud_trim 의 키 매핑으로 해석해 TrimAdjuster 에 넘긴다. 조정기가 quit 을
+    돌려주면 (5 저장 후 종료, q/Esc, Del) 프로그램이 아니라 조정 모드만 끈다.
+    수신과 렌더는 그동안에도 같은 루프에서 계속 돈다.
+    """
+
+    HELP = [
+        "keypad  7 key-  8 up    9 key+      * reset",
+        "        4 left  5 done  6 right     0/. step",
+        "        1 roll- 2 down  3 roll+     enter/+ save   Del/q cancel",
+    ]
+
+    def __init__(self, config: dict[str, Any], config_path: Path, renderer: Any) -> None:
+        self.config_path = config_path
+        self.mapper = renderer.mapper
+        self.steps = ensure_alignment_config(config)["trim_step"]
+        self.adjuster: TrimAdjuster | None = None
+        self._overlay_key: tuple[Any, ...] | None = None
+        self._overlay: np.ndarray | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.adjuster is not None
+
+    def _start(self) -> None:
+        mapper = self.mapper
+        self.adjuster = TrimAdjuster(
+            mapper.trim, self.steps, mapper.width, mapper.height,
+            mapper.set_trim, lambda trim: save_trim(self.config_path, trim),
+        )
+        self._overlay_key = None
+        print("trim adjust ON. 5 save and exit, Del or q exit")
+        print(_describe(self.adjuster))
+
+    def _stop(self) -> None:
+        adjuster = self.adjuster
+        assert adjuster is not None
+        if adjuster.dirty:
+            # 저장 안 한 값은 버리고 조정 전 화면으로 돌린다
+            self.mapper.set_trim(adjuster.saved)
+            print("unsaved trim was discarded.")
+        self.adjuster = None
+        print("trim adjust OFF")
+
+    def handle_key(self, key: int) -> bool:
+        """키를 가져갔으면 True. False 면 receive 의 원래 키 처리로 넘긴다."""
+        if key == -1:
+            return False
+        if self.adjuster is None:
+            if key in KEY_DELETE:
+                self._start()
+                return True
+            return False
+
+        command = TrimCommand(QUIT) if key in KEY_DELETE else key_to_command(key)
+        if command is None:
+            return True
+        event = self.adjuster.handle(command)
+        if event in ("changed", "step"):
+            print(_describe(self.adjuster))
+        elif event == "confirm_quit":
+            print("unsaved changes. enter: save and exit, "
+                  "q or Del: exit without saving, any other key: cancel")
+        elif event == "confirm_save":
+            print("save and exit? 5 again: yes, any other key: cancel")
+        elif event == "cancel":
+            print("cancelled")
+        elif event == "quit":
+            self._stop()
+        return True
+
+    def draw(self, canvas: np.ndarray) -> None:
+        adjuster = self.adjuster
+        if adjuster is None:
+            return
+        state = (_describe(adjuster), adjuster.confirming_quit, adjuster.confirming_save)
+        if state != self._overlay_key or self._overlay is None:
+            self._overlay_key = state
+            lines = [("ADJUST  " + state[0], OVERLAY_COLOR)]
+            lines += [(line, OVERLAY_COLOR) for line in self.HELP]
+            if adjuster.confirming_quit:
+                lines.append(("UNSAVED. enter: save+exit  q/Del: discard+exit  other: cancel",
+                              CONFIRM_COLOR))
+            if adjuster.confirming_save:
+                lines.append(("SAVE AND EXIT ADJUST? 5 again: yes  other: cancel",
+                              CONFIRM_COLOR))
+            self._overlay = _overlay(self.mapper.width, self.mapper.height, lines,
+                                     self.mapper.physical_flip_horizontal)
+        cv2.add(canvas, self._overlay, dst=canvas)
+
+
 def run_receive(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     ensure_ui_config(config)
@@ -1098,6 +1205,8 @@ def run_receive(args: argparse.Namespace) -> None:
 
     started = time.monotonic()
     stats = _LatencyStats(feed) if args.stats else None
+    trim = _ReceiveTrim(config, args.config, renderer)
+    print("Del: trim adjust mode")
 
     try:
         while True:
@@ -1110,14 +1219,19 @@ def run_receive(args: argparse.Namespace) -> None:
             if stats is not None:
                 stats.add(now, frame_args["debug"])
 
+            trim.draw(canvas)
             cv2.imshow(name, canvas)
-            key = cv2.waitKey(1) & 0xFF
+            # 조정 모드에서는 q, d 도 trim 키라서 원래 처리보다 먼저 넘긴다
+            key = cv2.waitKeyEx(1)
+            if trim.handle_key(key):
+                continue
             if key in (27, ord("q")):
                 break
             if key == ord("d"):
                 renderer.ui["debug"]["enabled"] = not renderer.ui["debug"]["enabled"]
     except KeyboardInterrupt:
-        pass
+        if trim.adjuster is not None and trim.adjuster.dirty:
+            print("interrupted. unsaved trim was discarded.")
     finally:
         feed.close()
         cv2.destroyAllWindows()

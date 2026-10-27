@@ -241,6 +241,11 @@ KEYPAD = {
     (KP_ENTER, ord("+"), KP_ADD): TrimCommand(SAVE),
 }
 
+# 별도 Delete 키. hud_ui receive 에서 조정 모드를 켜고 끄는 데 쓴다.
+# X keysym 은 0xFFFF, 윈도우는 0x2E0000, ASCII DEL 로 주는 환경도 있다.
+# 키패드 . 의 KP_Delete(65439) 와는 다른 코드라 겹치지 않는다.
+KEY_DELETE = (65535, 3014656, 127)
+
 KEY_ENTER = (13, 10)
 KEY_ESC = 27
 KEY_TAB = 9
@@ -360,6 +365,18 @@ def _describe(adjuster: TrimAdjuster) -> str:
             + ("  *" if adjuster.dirty else ""))
 
 
+def save_trim(path: Any, trim: TrimParams) -> None:
+    """trim 만 설정 파일에 쓴다.
+
+    렌더러가 채워 넣은 기본값까지 파일에 쓰지 않도록 디스크 본을
+    다시 읽어 trim 만 바꾼다.
+    """
+    disk = load_config(path)
+    ensure_alignment_config(disk)["trim"] = trim.to_config()
+    save_config(path, disk)
+    print(f"saved trim to {path}: {trim.to_config()}")
+
+
 def run_trim(args: argparse.Namespace) -> None:
     # 렌더러와 수신 경로는 receive 와 똑같은 것을 쓴다
     from hud_ui import LaneFeed, _open_window, ensure_ui_config, make_renderer
@@ -387,12 +404,7 @@ def run_trim(args: argparse.Namespace) -> None:
         mapper.set_trim(trim)
 
     def on_save(trim: TrimParams) -> None:
-        # 렌더러가 채워 넣은 기본값까지 파일에 쓰지 않도록 디스크 본을
-        # 다시 읽어 trim 만 바꾼다.
-        disk = load_config(args.config)
-        ensure_alignment_config(disk)["trim"] = trim.to_config()
-        save_config(args.config, disk)
-        print(f"saved trim to {args.config}: {trim.to_config()}")
+        save_trim(args.config, trim)
 
     adjuster = TrimAdjuster(
         mapper.trim, section["trim_step"], mapper.width, mapper.height,
