@@ -57,21 +57,19 @@
     "profiles": [],
     "blend": 0.0,
     "trim": {
-      "dx_px": 36.0,
-      "dy_px": -181.0,
-      "keystone": 0.006,
-      "roll_deg": 0.0
+      "dx_px": 9.0,
+      "dy_px": -339.0,
+      "top_scale": 1.22238,
+      "bottom_scale": 1.09
     },
     "trim_step": {
       "fine": {
         "move_px": 3.0,
-        "keystone": 0.005,
-        "roll_deg": 0.1
+        "scale": 0.01
       },
       "coarse": {
         "move_px": 25.0,
-        "keystone": 0.025,
-        "roll_deg": 1.0
+        "scale": 0.05
       }
     }
   },

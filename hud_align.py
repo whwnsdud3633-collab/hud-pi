@@ -16,14 +16,13 @@
     python3 hud_align.py trim                      # 실데이터 보며 키보드로 미세 보정
 
 trim 은 위 행렬을 다시 풀지 않는다. 행렬로 투영한 결과 위에 운전자 시점
-기준의 작은 보정 행렬 하나(평행이동, 상하 사다리꼴, 좌우 기울기)를 더 곱한다.
+기준의 작은 보정 행렬 하나(평행이동, 윗변·아랫변 폭 배율)를 더 곱한다.
 자세한 합성 순서는 TrimParams 와 AlignmentMap.project 에 있다.
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -45,24 +44,43 @@ DEFAULT_ALIGNMENT: dict[str, Any] = {
     "pairs": [],
     "profiles": [],
     "blend": 0.0,
-    "trim": {"dx_px": 0.0, "dy_px": 0.0, "keystone": 0.0, "roll_deg": 0.0},
+    "trim": {"dx_px": 0.0, "dy_px": 0.0, "top_scale": 1.0, "bottom_scale": 1.0},
 }
 
 # 트림 한 번 누를 때 움직이는 양. fine 이 기본이고 coarse 는 큰 폭.
 DEFAULT_TRIM_STEP: dict[str, dict[str, float]] = {
-    "fine": {"move_px": 1.0, "keystone": 0.002, "roll_deg": 0.05},
-    "coarse": {"move_px": 8.0, "keystone": 0.01, "roll_deg": 0.5},
+    "fine": {"move_px": 1.0, "scale": 0.01},
+    "coarse": {"move_px": 8.0, "scale": 0.05},
 }
 
-# 이 범위를 넘으면 보정이 아니라 설치가 틀어진 것이다. 키를 눌러도 더
-# 가지 않게 막아 두면 사다리꼴 분모가 0 쪽으로 가는 일도 없다.
-TRIM_LIMITS = {"keystone": 0.2, "roll_deg": 15.0}
+# 폭 배율 범위. 이 밖이면 보정이 아니라 설치가 틀어진 것이다.
+TRIM_SCALE_RANGE = (0.5, 2.0)
+
+# 예전 trim 키. 읽을 때 새 키로 옮기고 지운다.
+_LEGACY_TRIM_KEYS = ("keystone", "roll_deg")
+
+
+def _migrate_trim(section: dict[str, Any]) -> None:
+    """keystone/roll_deg 시절 설정을 top_scale 로 옮긴다.
+
+    예전 keystone k 는 화면 맨 아랫줄을 축으로 맨 윗줄 폭을 1 / (1 - 2k) 배로
+    만들었다. 같은 윗줄 폭이 되도록 top_scale 로 환산한다. roll_deg 는 버린다.
+    """
+    trim = section.get("trim")
+    if isinstance(trim, dict) and "keystone" in trim:
+        k = float(trim["keystone"])
+        trim.setdefault("top_scale", round(1.0 / max(1e-6, 1.0 - 2.0 * k), 5))
+    for raw in [trim, *(section.get("trim_step") or {}).values()]:
+        if isinstance(raw, dict):
+            for key in _LEGACY_TRIM_KEYS:
+                raw.pop(key, None)
 
 
 def ensure_alignment_config(config: dict[str, Any]) -> dict[str, Any]:
     section = config.setdefault("alignment", {})
     for key, value in DEFAULT_ALIGNMENT.items():
         section.setdefault(key, dict(value) if isinstance(value, dict) else value)
+    _migrate_trim(section)
     trim = section["trim"]
     for key, value in DEFAULT_ALIGNMENT["trim"].items():
         trim.setdefault(key, value)
@@ -79,54 +97,52 @@ class TrimParams:
     """기존 정렬 위에 얹는 미세 보정 4개. 전부 운전자가 보는 방향 기준이다.
 
     dx_px, dy_px  평행이동. 패널 픽셀. +x 는 운전자 기준 오른쪽, +y 는 아래.
-    keystone      상하 사다리꼴. + 면 위쪽 폭이 넓어진다. 화면 맨 아랫줄이 축이라
-                  아랫줄 폭과 높이는 그대로다. 가까운 차선을 평행이동으로 먼저
-                  맞춘 뒤 이것으로 먼 쪽 벌어짐만 맞추면 앞서 맞춘 것이 안 깨진다.
-                  0.01 이면 화면 맨 윗줄 폭이 약 2% 넓어진다.
-    roll_deg      좌우 기울기. 화면 중앙을 축으로 돌린다. + 면 시계 방향이라
-                  오른쪽이 내려가고 왼쪽이 올라간다.
+    top_scale     화면 맨 윗줄 가로 폭 배율. 화면 세로 중심선이 축이다.
+    bottom_scale  화면 맨 아랫줄 가로 폭 배율. 둘 다 1.0 이면 그대로이고
+                  0.5~2.0 으로 막는다. 가까운 차선을 평행이동과 bottom_scale 로
+                  먼저 맞춘 뒤 top_scale 로 먼 쪽 벌어짐을 맞춘다.
 
     보정은 화면 중앙 (cx, cy) 을 원점으로, 화면 반 높이 s 를 단위로 한
-    좌표 (u, v) 에서 정의한다. v 는 맨 위가 -1, 맨 아래가 +1 이다. 가로세로에
-    같은 s 를 써야 회전이 찌그러지지 않는다.
+    좌표 (u, v) 에서 정의한다. v 는 맨 위가 -1, 맨 아래가 +1 이다.
 
-        K = [[1, 0, 0], [0, 1, -k], [0, k, 1 - k]]  사다리꼴 (w = 1 + k·(v - 1))
-        R = 회전 roll_deg                          기울기
+        단위 사각형 (±1, -1), (±1, +1) 을
+        (±top_scale, -1), (±bottom_scale, +1) 로 보내는 호모그래피 P
         T = 평행이동 (dx/s, dy/s)
-        보정 = N⁻¹ · T · R · K · N                 N 은 픽셀 -> (u, v)
+        보정 = N⁻¹ · T · P · N                 N 은 픽셀 -> (u, v)
 
-    K 는 아랫줄 v = 1 로 옮긴 뒤 투영 행 [0, k, 1] 을 걸고 되돌린 것이라
-    v = 1 에서 w = 1 이다. 그 위로 갈수록 w 가 1 보다 작아져 벌어진다.
-    투영 성분이라 결과가 여전히 호모그래피이고, 가상상 평면이 아랫변을
-    축으로 살짝 숙여진 것과 같은 변형이다.
+    P 는 네 모서리 대응으로 cv2.getPerspectiveTransform 이 푼다. 행렬 원소를
+    직접 만들지 않는다. 윗변·아랫변 높이는 그대로이고 중간 줄은 원근에 맞게
+    따라 움직이므로, 가상상 평면이 가로축을 중심으로 기울어진 것과 같은 변형이다.
+    u 방향은 선형이라 단위 사각형의 가로 폭을 어떻게 잡아도 P 는 같다.
     """
 
     dx_px: float = 0.0
     dy_px: float = 0.0
-    keystone: float = 0.0
-    roll_deg: float = 0.0
+    top_scale: float = 1.0
+    bottom_scale: float = 1.0
 
     @classmethod
     def from_config(cls, section: dict[str, Any]) -> "TrimParams":
         raw = section.get("trim") or {}
-        return cls(**{k: float(raw.get(k, 0.0)) for k in cls.__dataclass_fields__})
+        return cls(**{k: float(raw.get(k, f.default))
+                      for k, f in cls.__dataclass_fields__.items()})
 
     def to_config(self) -> dict[str, float]:
         return {k: round(v, 5) for k, v in asdict(self).items()}
 
     def clamped(self, width: int, height: int) -> "TrimParams":
-        k_max, r_max = TRIM_LIMITS["keystone"], TRIM_LIMITS["roll_deg"]
+        lo, hi = TRIM_SCALE_RANGE
         return replace(
             self,
             dx_px=float(np.clip(self.dx_px, -width, width)),
             dy_px=float(np.clip(self.dy_px, -height, height)),
-            keystone=float(np.clip(self.keystone, -k_max, k_max)),
-            roll_deg=float(np.clip(self.roll_deg, -r_max, r_max)),
+            top_scale=float(np.clip(self.top_scale, lo, hi)),
+            bottom_scale=float(np.clip(self.bottom_scale, lo, hi)),
         )
 
     @property
     def is_identity(self) -> bool:
-        return not any(asdict(self).values())
+        return self == TrimParams()
 
     def viewer_matrix(self, width: int, height: int) -> np.ndarray:
         """운전자가 보는 방향의 픽셀 좌표에서 쓰는 3x3 보정 행렬."""
@@ -134,15 +150,12 @@ class TrimParams:
         s = max(1.0, (height - 1) / 2.0)
         to_unit = np.array([[1 / s, 0, -cx / s], [0, 1 / s, -cy / s], [0, 0, 1]])
         from_unit = np.linalg.inv(to_unit)
-        k = self.keystone
-        keystone = np.array([[1, 0, 0], [0, 1, -k], [0, k, 1 - k]])
-        a = math.radians(self.roll_deg)
-        # 영상 좌표는 y 가 아래로 자라므로 이 행렬은 화면에서 시계 방향이다
-        roll = np.array([[math.cos(a), -math.sin(a), 0],
-                         [math.sin(a), math.cos(a), 0],
-                         [0, 0, 1]])
+        t, b = self.top_scale, self.bottom_scale
+        src = np.float32([[-1, -1], [1, -1], [1, 1], [-1, 1]])
+        dst = np.float32([[-t, -1], [t, -1], [b, 1], [-b, 1]])
+        scale = cv2.getPerspectiveTransform(src, dst).astype(np.float64)
         move = np.array([[1, 0, self.dx_px / s], [0, 1, self.dy_px / s], [0, 0, 1]])
-        return from_unit @ move @ roll @ keystone @ to_unit
+        return from_unit @ move @ scale @ to_unit
 
     def panel_matrix(
         self, width: int, height: int, flip_h: bool, flip_v: bool
@@ -152,7 +165,8 @@ class TrimParams:
         반사 광학계가 상을 뒤집으므로 패널에서의 이동은 운전자가 보는
         이동과 방향이 다르다. 물리적 반전 F 로 감싸 F · V · F 로 바꾼다.
         그래야 키를 오른쪽으로 누르면 운전자 눈에도 오른쪽으로 간다.
-        반전은 화면 중앙에 대해 대칭이라 사다리꼴 축과 회전 중심이 그대로다.
+        반전은 화면 중앙에 대해 대칭이라 세로 중심선 축이 그대로다.
+        상하 반전이면 운전자가 보는 윗변이 패널에서는 아랫변이 된다.
         """
         flip = np.diag([-1.0 if flip_h else 1.0, -1.0 if flip_v else 1.0, 1.0])
         flip[0, 2] = (width - 1) if flip_h else 0.0
@@ -238,7 +252,7 @@ class AlignmentMap:
 
         # 미세 보정은 최종 패널 좌표 위에 마지막으로 곱한다. 기본 행렬의
         # w 로 소실선 판정을 끝낸 뒤라 그 판정은 트림과 무관하게 유지된다.
-        # 사다리꼴은 화면에서 아주 먼 점의 w 를 뒤집을 수 있어 따로 거른다.
+        # 폭 배율의 원근 성분이 화면에서 아주 먼 점의 w 를 뒤집을 수 있어 따로 거른다.
         if self.trim_matrix is not None:
             moved = np.hstack([uv, np.ones((len(uv), 1))]) @ self.trim_matrix.T
             w = moved[:, 2]

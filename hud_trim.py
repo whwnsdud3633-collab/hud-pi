@@ -16,7 +16,7 @@ UDP 메시지 같은 입력 장치 사정은 여기서 끝난다. TrimAdjuster �
 돌려주는 클래스 하나만 새로 만들면 된다. 절대값을 주는 소스(아이트래킹 등)는
 TrimCommand.set 으로 값을 통째로 넘긴다.
 
-값 4개가 기존 정렬과 어떻게 합쳐지는지는 hud_align.TrimParams 에 있다.
+값 4개(이동 x/y, 윗변·아랫변 폭 배율)가 기존 정렬과 어떻게 합쳐지는지는 hud_align.TrimParams 에 있다.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from hud_system import _mock_lane, load_config, save_config
 # 명령: 입력 장치와 보정 로직 사이의 약속
 # ---------------------------------------------------------------------------
 
-MOVE, KEYSTONE, ROLL = "move", "keystone", "roll"
+MOVE, SCALE = "move", "scale"
 RESET, SAVE, QUIT, TOGGLE_STEP, SET = "reset", "save", "quit", "toggle_step", "set"
 SAVE_QUIT = "save_quit"
 OTHER = "other"     # 뜻 없는 입력. 종료 확인을 취소하는 데만 쓰인다
@@ -48,8 +48,7 @@ class TrimCommand:
     """보정 명령 하나. 방향은 전부 운전자가 보는 화면 기준이다.
 
     move      dx, dy 는 -1/0/+1 방향. +x 오른쪽, +y 아래
-    keystone  sign +1 이면 위쪽 폭이 넓어진다
-    roll      sign +1 이면 시계 방향 (오른쪽이 내려감)
+    scale     top, bottom 은 -1/0/+1. +1 이면 윗변/아랫변 폭이 넓어진다
     save_quit 저장하고 종료. 바뀐 게 있으면 한 번 더 확인한다
     set       value 로 값을 통째로 바꾼다. 절대값을 주는 소스용
     other     그 밖의 입력. 값은 안 바꾸고 종료 확인만 취소한다
@@ -60,7 +59,8 @@ class TrimCommand:
     action: str
     dx: int = 0
     dy: int = 0
-    sign: int = 0
+    top: int = 0
+    bottom: int = 0
     coarse: bool | None = None
     count: int = 1
     value: TrimParams | None = None
@@ -185,10 +185,12 @@ class TrimAdjuster:
                 dx_px=t.dx_px + command.dx * n * step["move_px"],
                 dy_px=t.dy_px + command.dy * n * step["move_px"],
             ))
-        if action == KEYSTONE:
-            return self._set(replace(t, keystone=t.keystone + command.sign * n * step["keystone"]))
-        if action == ROLL:
-            return self._set(replace(t, roll_deg=t.roll_deg + command.sign * n * step["roll_deg"]))
+        if action == SCALE:
+            return self._set(replace(
+                t,
+                top_scale=t.top_scale + command.top * n * step["scale"],
+                bottom_scale=t.bottom_scale + command.bottom * n * step["scale"],
+            ))
         return "none"
 
 
@@ -206,9 +208,9 @@ ARROW_DOWN = (65364, 2621440)
 
 # 숫자 키패드. 운전석에서 한 손으로 쓰라고 둔 배치다.
 #
-#     7 위 좁게   8 위      9 위 넓게    * 리셋
-#     4 왼쪽      5 저장 후 종료  6 오른쪽
-#     1 반시계    2 아래    3 시계
+#     7 위폭 좁게    8 위         9 위폭 넓게      / 전체 폭 좁게
+#     4 왼쪽         5 저장+종료  6 오른쪽         * 리셋
+#     1 아래폭 좁게  2 아래       3 아래폭 넓게    - 전체 폭 넓게
 #     0 또는 . 큰 폭/작은 폭       Enter, + 저장
 #
 # 5 는 게임패드 확인 버튼처럼 쓰라고 방향키 가운데에 뒀다. 바뀐 값이 있으면
@@ -216,13 +218,13 @@ ARROW_DOWN = (65364, 2621440)
 #
 # Num Lock 이 켜져 있으면 Qt 가 일반 숫자와 같은 '0'~'9' 로 준다. 꺼져 있으면
 # 키패드 전용 X keysym (KP_Home 등) 이 온다. 둘 다 받는다. * 와 + 는
-# Num Lock 과 상관없이 '*', '+' 로 온다. . 은 켜져 있으면 '.', 꺼져 있으면
+# Num Lock 과 상관없이 '*', '+' 로 온다 (/, - 도 같을 것으로 보고 KP_ 코드도 받는다). . 은 켜져 있으면 '.', 꺼져 있으면
 # KP_Delete 로 오고 KP_Decimal 로 주는 환경도 있어 셋 다 받는다. 키패드 Enter 는 이 파이에서 일반
 # Enter 와 같은 13 으로 왔지만 KP_Enter 로 주는 환경도 있어 같이 받는다.
 KP_HOME, KP_LEFT, KP_UP, KP_RIGHT, KP_DOWN = 65429, 65430, 65431, 65432, 65433
 KP_PRIOR, KP_NEXT, KP_END, KP_BEGIN, KP_INSERT = 65434, 65435, 65436, 65437, 65438
 KP_ENTER = 65421
-KP_ADD = 65451
+KP_ADD, KP_SUBTRACT, KP_DIVIDE = 65451, 65453, 65455
 KP_DELETE, KP_DECIMAL = 65439, 65454
 
 KEYPAD = {
@@ -230,10 +232,12 @@ KEYPAD = {
     (ord("2"), KP_DOWN): TrimCommand(MOVE, dy=1),
     (ord("4"), KP_LEFT): TrimCommand(MOVE, dx=-1),
     (ord("6"), KP_RIGHT): TrimCommand(MOVE, dx=1),
-    (ord("7"), KP_HOME): TrimCommand(KEYSTONE, sign=-1),   # s 와 같음
-    (ord("9"), KP_PRIOR): TrimCommand(KEYSTONE, sign=1),   # w 와 같음
-    (ord("1"), KP_END): TrimCommand(ROLL, sign=-1),        # a 와 같음
-    (ord("3"), KP_NEXT): TrimCommand(ROLL, sign=1),        # d 와 같음
+    (ord("7"), KP_HOME): TrimCommand(SCALE, top=-1),       # s 와 같음
+    (ord("9"), KP_PRIOR): TrimCommand(SCALE, top=1),       # w 와 같음
+    (ord("1"), KP_END): TrimCommand(SCALE, bottom=-1),     # z 와 같음
+    (ord("3"), KP_NEXT): TrimCommand(SCALE, bottom=1),     # x 와 같음
+    (ord("/"), KP_DIVIDE): TrimCommand(SCALE, top=-1, bottom=-1),
+    (ord("-"), KP_SUBTRACT): TrimCommand(SCALE, top=1, bottom=1),
     (ord("5"), KP_BEGIN): TrimCommand(SAVE_QUIT),
     (ord("*"),): TrimCommand(RESET),
     (ord("0"), KP_INSERT): TrimCommand(TOGGLE_STEP),
@@ -280,14 +284,13 @@ def key_to_command(key: int) -> TrimCommand | None:
         if key in codes:
             return command
     letters = {
-        "w": (KEYSTONE, 1),     # 위쪽 폭 넓게
-        "s": (KEYSTONE, -1),    # 위쪽 폭 좁게
-        "a": (ROLL, -1),        # 반시계. 왼쪽이 내려가고 오른쪽이 올라감
-        "d": (ROLL, 1),         # 시계. 오른쪽이 내려가고 왼쪽이 올라감
+        "w": TrimCommand(SCALE, top=1),        # 위폭 넓게
+        "s": TrimCommand(SCALE, top=-1),       # 위폭 좁게
+        "z": TrimCommand(SCALE, bottom=-1),    # 아래폭 좁게
+        "x": TrimCommand(SCALE, bottom=1),     # 아래폭 넓게
     }
     if 0 <= key < 256 and chr(key).lower() in letters:
-        action, sign = letters[chr(key).lower()]
-        return TrimCommand(action, sign=sign)
+        return letters[chr(key).lower()]
     if key in MODIFIER_KEYS or key == KEY_NUM_LOCK:
         return None
     return TrimCommand(OTHER)
@@ -355,9 +358,13 @@ def _overlay(
 
 def _describe(adjuster: TrimAdjuster) -> str:
     t = adjuster.trim
-    return (f"TRIM x {t.dx_px:+.0f}  y {t.dy_px:+.0f}  key {t.keystone:+.3f}  "
-            f"roll {t.roll_deg:+.2f}   STEP {'coarse' if adjuster.coarse else 'fine'}"
+    return (f"TRIM x {t.dx_px:+.0f}  y {t.dy_px:+.0f}  {_scales(t)}"
+            f"   STEP {'coarse' if adjuster.coarse else 'fine'}"
             + ("  *" if adjuster.dirty else ""))
+
+
+def _scales(t: TrimParams) -> str:
+    return f"top x{t.top_scale:.2f}  bottom x{t.bottom_scale:.2f}"
 
 
 def save_trim(path: Any, trim: TrimParams) -> None:
@@ -411,18 +418,18 @@ def run_trim(args: argparse.Namespace) -> None:
 
     name = "HUD trim"
     _open_window(name, renderer, args.windowed, bool(display["fullscreen"]))
-    print("arrows move, w/s keystone, a/d roll, f or tab coarse/fine,")
+    print("arrows move, w/s top width, z/x bottom width, f or tab coarse/fine,")
     print("enter save, q quit")
-    print("keypad: 8/2/4/6 move, 7/9 keystone, 1/3 roll, * reset, 0 or . step,")
-    print("        enter or + save, 5 save and quit")
+    print("keypad: 8/2/4/6 move, 7/9 top width, 1/3 bottom width, / - both,")
+    print("        * reset, 0 or . step, enter or + save, 5 save and quit")
     print(_describe(adjuster))
 
     mirror = mapper.physical_flip_horizontal
     help_lines = [
-        "arrows move  w/s keystone  a/d roll  f step  enter save  q quit",
-        "keypad  7 key-  8 up    9 key+      * reset",
-        "        4 left  5 done  6 right     0/. step",
-        "        1 roll- 2 down  3 roll+     enter/+ save  (5 done = save+quit)",
+        "arrows move  w/s top  z/x bottom  f step  enter save  q quit",
+        "keypad  7 top-     8 up    9 top+       / both-   * reset",
+        "        4 left     5 done  6 right      - both+   0/. step",
+        "        1 bottom-  2 down  3 bottom+    enter/+ save  (5 done = save+quit)",
     ]
     overlay_key: tuple[Any, ...] | None = None
     overlay = None

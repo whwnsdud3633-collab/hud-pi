@@ -50,6 +50,7 @@ from hud_trim import (
     TrimCommand,
     _describe,
     _overlay,
+    _scales,
     save_trim,
 )
 # 무수신 판정, 페이드, 디바운싱은 그리기 코드가 아니라 상태 계층이 맡는다
@@ -1143,8 +1144,8 @@ class _ReceiveTrim:
         adjuster = self.adjuster
         t = adjuster.trim
         text = (f"STEP {'coarse' if adjuster.coarse else 'fine'}  "
-                f"x {t.dx_px:+.0f}  y {t.dy_px:+.0f}  key {t.keystone:+.3f}  "
-                f"roll {t.roll_deg:+.2f}" + ("  *" if adjuster.dirty else ""))
+                f"x {t.dx_px:+.0f}  y {t.dy_px:+.0f}  {_scales(t)}"
+                + ("  *" if adjuster.dirty else ""))
         if text != self._overlay_key or self._overlay is None:
             self._overlay_key = text
             self._overlay = _overlay(self.mapper.width, self.mapper.height,
@@ -1171,7 +1172,7 @@ def run_receive(args: argparse.Namespace) -> None:
     started = time.monotonic()
     stats = _LatencyStats(feed) if args.stats else None
     trim = _ReceiveTrim(config, args.config, renderer)
-    print("keypad trim: 8/2/4/6 move, 7/9 keystone, 1/3 roll, 0/f/tab step, "
+    print("keypad trim: 8/2/4/6 move, 7/9 top width, 1/3 bottom width, / - both, 0/f/tab step, "
           "* reset, 5/enter/+ save. q/esc quit")
 
     try:
