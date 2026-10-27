@@ -241,11 +241,6 @@ KEYPAD = {
     (KP_ENTER, ord("+"), KP_ADD): TrimCommand(SAVE),
 }
 
-# 별도 Delete 키. hud_ui receive 에서 조정 모드를 켜고 끄는 데 쓴다.
-# X keysym 은 0xFFFF, 윈도우는 0x2E0000, ASCII DEL 로 주는 환경도 있다.
-# 키패드 . 의 KP_Delete(65439) 와는 다른 코드라 겹치지 않는다.
-KEY_DELETE = (65535, 3014656, 127)
-
 KEY_ENTER = (13, 10)
 KEY_ESC = 27
 KEY_TAB = 9

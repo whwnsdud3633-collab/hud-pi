@@ -37,17 +37,19 @@ from hud_theme import (
     ThemeRenderer,
     normalize_state,
 )
-# receive 중 trim 조정은 trim 도구의 키 해석과 보정 로직을 그대로 쓴다
+# receive 중 trim 조정은 trim 도구의 키패드 배치와 보정 로직을 그대로 쓴다
 from hud_trim import (
-    CONFIRM_COLOR,
-    KEY_DELETE,
+    KEY_ENTER,
+    KEY_TAB,
+    KEYPAD,
     OVERLAY_COLOR,
-    QUIT,
+    SAVE,
+    SAVE_QUIT,
+    TOGGLE_STEP,
     TrimAdjuster,
     TrimCommand,
     _describe,
     _overlay,
-    key_to_command,
     save_trim,
 )
 # 무수신 판정, 페이드, 디바운싱은 그리기 코드가 아니라 상태 계층이 맡는다
@@ -1095,95 +1097,58 @@ class _LatencyStats:
 
 
 class _ReceiveTrim:
-    """receive 실행 중 Del 로 켜는 trim 조정 모드.
+    """receive 실행 중 키패드로 언제든 trim 을 맞춘다. 모드 전환은 없다.
 
-    꺼져 있을 때는 Del 말고는 아무 키도 가로채지 않는다. 켜지면 모든 키를
-    hud_trim 의 키 매핑으로 해석해 TrimAdjuster 에 넘긴다. 조정기가 quit 을
-    돌려주면 (5 저장 후 종료, q/Esc, Del) 프로그램이 아니라 조정 모드만 끈다.
-    수신과 렌더는 그동안에도 같은 루프에서 계속 돈다.
+    키패드 배치는 hud_trim 과 같고, 뜻이 정해진 키만 가져간다. 나머지 키
+    (q, Esc, d 등) 는 receive 의 원래 처리로 넘긴다. 5 는 trim 도구에서는
+    저장 후 종료지만 여기서는 프로그램을 끝내지 않으므로 Enter 처럼 저장만
+    한다. 저장·종료 확인이 없으니 TrimAdjuster 의 확인 상태는 쓰이지 않는다.
+    수신과 렌더는 같은 루프에서 계속 돈다.
     """
-
-    HELP = [
-        "keypad  7 key-  8 up    9 key+      * reset",
-        "        4 left  5 done  6 right     0/. step",
-        "        1 roll- 2 down  3 roll+     enter/+ save   Del/q cancel",
-    ]
 
     def __init__(self, config: dict[str, Any], config_path: Path, renderer: Any) -> None:
         self.config_path = config_path
         self.mapper = renderer.mapper
-        self.steps = ensure_alignment_config(config)["trim_step"]
-        self.adjuster: TrimAdjuster | None = None
-        self._overlay_key: tuple[Any, ...] | None = None
+        self.adjuster = TrimAdjuster(
+            self.mapper.trim, ensure_alignment_config(config)["trim_step"],
+            self.mapper.width, self.mapper.height,
+            self.mapper.set_trim, lambda trim: save_trim(config_path, trim),
+        )
+        self._overlay_key: str | None = None
         self._overlay: np.ndarray | None = None
 
-    @property
-    def active(self) -> bool:
-        return self.adjuster is not None
-
-    def _start(self) -> None:
-        mapper = self.mapper
-        self.adjuster = TrimAdjuster(
-            mapper.trim, self.steps, mapper.width, mapper.height,
-            mapper.set_trim, lambda trim: save_trim(self.config_path, trim),
-        )
-        self._overlay_key = None
-        print("trim adjust ON. 5 save and exit, Del or q exit")
-        print(_describe(self.adjuster))
-
-    def _stop(self) -> None:
-        adjuster = self.adjuster
-        assert adjuster is not None
-        if adjuster.dirty:
-            # 저장 안 한 값은 버리고 조정 전 화면으로 돌린다
-            self.mapper.set_trim(adjuster.saved)
-            print("unsaved trim was discarded.")
-        self.adjuster = None
-        print("trim adjust OFF")
+    @staticmethod
+    def _command(key: int) -> TrimCommand | None:
+        if key in KEY_ENTER:
+            return TrimCommand(SAVE)
+        if key in (KEY_TAB, ord("f"), ord("F")):
+            return TrimCommand(TOGGLE_STEP)
+        for codes, command in KEYPAD.items():
+            if key in codes:
+                return TrimCommand(SAVE) if command.action == SAVE_QUIT else command
+        return None
 
     def handle_key(self, key: int) -> bool:
         """키를 가져갔으면 True. False 면 receive 의 원래 키 처리로 넘긴다."""
         if key == -1:
             return False
-        if self.adjuster is None:
-            if key in KEY_DELETE:
-                self._start()
-                return True
-            return False
-
-        command = TrimCommand(QUIT) if key in KEY_DELETE else key_to_command(key)
+        command = self._command(key)
         if command is None:
-            return True
-        event = self.adjuster.handle(command)
-        if event in ("changed", "step"):
+            return False
+        if self.adjuster.handle(command) in ("changed", "step"):
             print(_describe(self.adjuster))
-        elif event == "confirm_quit":
-            print("unsaved changes. enter: save and exit, "
-                  "q or Del: exit without saving, any other key: cancel")
-        elif event == "confirm_save":
-            print("save and exit? 5 again: yes, any other key: cancel")
-        elif event == "cancel":
-            print("cancelled")
-        elif event == "quit":
-            self._stop()
         return True
 
     def draw(self, canvas: np.ndarray) -> None:
         adjuster = self.adjuster
-        if adjuster is None:
-            return
-        state = (_describe(adjuster), adjuster.confirming_quit, adjuster.confirming_save)
-        if state != self._overlay_key or self._overlay is None:
-            self._overlay_key = state
-            lines = [("ADJUST  " + state[0], OVERLAY_COLOR)]
-            lines += [(line, OVERLAY_COLOR) for line in self.HELP]
-            if adjuster.confirming_quit:
-                lines.append(("UNSAVED. enter: save+exit  q/Del: discard+exit  other: cancel",
-                              CONFIRM_COLOR))
-            if adjuster.confirming_save:
-                lines.append(("SAVE AND EXIT ADJUST? 5 again: yes  other: cancel",
-                              CONFIRM_COLOR))
-            self._overlay = _overlay(self.mapper.width, self.mapper.height, lines,
+        t = adjuster.trim
+        text = (f"STEP {'coarse' if adjuster.coarse else 'fine'}  "
+                f"x {t.dx_px:+.0f}  y {t.dy_px:+.0f}  key {t.keystone:+.3f}  "
+                f"roll {t.roll_deg:+.2f}" + ("  *" if adjuster.dirty else ""))
+        if text != self._overlay_key or self._overlay is None:
+            self._overlay_key = text
+            self._overlay = _overlay(self.mapper.width, self.mapper.height,
+                                     [(text, OVERLAY_COLOR)],
                                      self.mapper.physical_flip_horizontal)
         cv2.add(canvas, self._overlay, dst=canvas)
 
@@ -1206,7 +1171,8 @@ def run_receive(args: argparse.Namespace) -> None:
     started = time.monotonic()
     stats = _LatencyStats(feed) if args.stats else None
     trim = _ReceiveTrim(config, args.config, renderer)
-    print("Del: trim adjust mode")
+    print("keypad trim: 8/2/4/6 move, 7/9 keystone, 1/3 roll, 0/f/tab step, "
+          "* reset, 5/enter/+ save. q/esc quit")
 
     try:
         while True:
@@ -1221,7 +1187,7 @@ def run_receive(args: argparse.Namespace) -> None:
 
             trim.draw(canvas)
             cv2.imshow(name, canvas)
-            # 조정 모드에서는 q, d 도 trim 키라서 원래 처리보다 먼저 넘긴다
+            # 키패드 숫자는 언제나 trim 키다. 나머지는 원래 처리로 간다
             key = cv2.waitKeyEx(1)
             if trim.handle_key(key):
                 continue
@@ -1230,9 +1196,10 @@ def run_receive(args: argparse.Namespace) -> None:
             if key == ord("d"):
                 renderer.ui["debug"]["enabled"] = not renderer.ui["debug"]["enabled"]
     except KeyboardInterrupt:
-        if trim.adjuster is not None and trim.adjuster.dirty:
-            print("interrupted. unsaved trim was discarded.")
+        pass
     finally:
+        if trim.adjuster.dirty:
+            print("unsaved trim was discarded.")
         feed.close()
         cv2.destroyAllWindows()
 
