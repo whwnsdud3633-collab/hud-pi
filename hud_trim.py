@@ -209,19 +209,21 @@ ARROW_DOWN = (65364, 2621440)
 #     7 위 좁게   8 위      9 위 넓게    * 리셋
 #     4 왼쪽      5 저장 후 종료  6 오른쪽
 #     1 반시계    2 아래    3 시계
-#     0 큰 폭/작은 폭        Enter, + 저장
+#     0 또는 . 큰 폭/작은 폭       Enter, + 저장
 #
 # 5 는 게임패드 확인 버튼처럼 쓰라고 방향키 가운데에 뒀다. 바뀐 값이 있으면
 # 한 번 더 눌러야 저장된다 (TrimAdjuster 참조).
 #
 # Num Lock 이 켜져 있으면 Qt 가 일반 숫자와 같은 '0'~'9' 로 준다. 꺼져 있으면
 # 키패드 전용 X keysym (KP_Home 등) 이 온다. 둘 다 받는다. * 와 + 는
-# Num Lock 과 상관없이 '*', '+' 로 온다. 키패드 Enter 는 이 파이에서 일반
+# Num Lock 과 상관없이 '*', '+' 로 온다. . 은 켜져 있으면 '.', 꺼져 있으면
+# KP_Delete 로 오고 KP_Decimal 로 주는 환경도 있어 셋 다 받는다. 키패드 Enter 는 이 파이에서 일반
 # Enter 와 같은 13 으로 왔지만 KP_Enter 로 주는 환경도 있어 같이 받는다.
 KP_HOME, KP_LEFT, KP_UP, KP_RIGHT, KP_DOWN = 65429, 65430, 65431, 65432, 65433
 KP_PRIOR, KP_NEXT, KP_END, KP_BEGIN, KP_INSERT = 65434, 65435, 65436, 65437, 65438
 KP_ENTER = 65421
 KP_ADD = 65451
+KP_DELETE, KP_DECIMAL = 65439, 65454
 
 KEYPAD = {
     (ord("8"), KP_UP): TrimCommand(MOVE, dy=-1),
@@ -235,6 +237,7 @@ KEYPAD = {
     (ord("5"), KP_BEGIN): TrimCommand(SAVE_QUIT),
     (ord("*"),): TrimCommand(RESET),
     (ord("0"), KP_INSERT): TrimCommand(TOGGLE_STEP),
+    (ord("."), KP_DELETE, KP_DECIMAL): TrimCommand(TOGGLE_STEP),
     (KP_ENTER, ord("+"), KP_ADD): TrimCommand(SAVE),
 }
 
@@ -254,7 +257,7 @@ def key_to_command(key: int) -> TrimCommand | None:
     숫자 키패드 배치는 KEYPAD 에 있다. 키패드가 일반 숫자와 같은 코드로
     오므로 윗줄 숫자도 같은 동작을 한다.
 
-    큰 폭/작은 폭은 f, Tab, 0 으로 켜고 끈다. Shift 조합은 쓰지 않는다.
+    큰 폭/작은 폭은 f, Tab, 0, . 으로 켜고 끈다. Shift 조합은 쓰지 않는다.
     이 파이의 OpenCV(Qt 백엔드) 는 waitKeyEx 에 Shift 상태를 싣지 않아
     Shift+방향키가 방향키와 같은 코드로 오고, Shift+w 도 'w' 로 왔다.
     글자 키는 대소문자를 가리지 않는다. Caps Lock 이 켜져 있어도 된다.
@@ -403,7 +406,7 @@ def run_trim(args: argparse.Namespace) -> None:
     _open_window(name, renderer, args.windowed, bool(display["fullscreen"]))
     print("arrows move, w/s keystone, a/d roll, f or tab coarse/fine,")
     print("enter save, q quit")
-    print("keypad: 8/2/4/6 move, 7/9 keystone, 1/3 roll, * reset, 0 step,")
+    print("keypad: 8/2/4/6 move, 7/9 keystone, 1/3 roll, * reset, 0 or . step,")
     print("        enter or + save, 5 save and quit")
     print(_describe(adjuster))
 
@@ -411,7 +414,7 @@ def run_trim(args: argparse.Namespace) -> None:
     help_lines = [
         "arrows move  w/s keystone  a/d roll  f step  enter save  q quit",
         "keypad  7 key-  8 up    9 key+      * reset",
-        "        4 left  5 done  6 right     0 step",
+        "        4 left  5 done  6 right     0/. step",
         "        1 roll- 2 down  3 roll+     enter/+ save  (5 done = save+quit)",
     ]
     overlay_key: tuple[Any, ...] | None = None
