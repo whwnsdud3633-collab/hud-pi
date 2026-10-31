@@ -1,0 +1,98 @@
+{
+  "network": {
+    "bind_host": "0.0.0.0",
+    "port": 5005,
+    "packet_timeout_seconds": 0.35
+  },
+  "state": {
+    "lane_fade_seconds": 0.4,
+    "caution_timeout_seconds": 1.2,
+    "rise_frames": 3,
+    "fall_frames": 5
+  },
+  "display": {
+    "width": 1920,
+    "height": 1200,
+    "fullscreen": true,
+    "window_name": "Rain Lane HUD",
+    "line_thickness": 12,
+    "line_color_bgr": [
+      255,
+      255,
+      255
+    ],
+    "flip_horizontal": false,
+    "flip_vertical": true,
+    "show_status": false,
+    "smoothing_alpha": 1.0,
+    "association_distance": 0.18,
+    "jump_gate_distance": 0.0,
+    "jump_gate_frames": 3,
+    "edge_stops": [
+      [
+        0.0,
+        1.0
+      ],
+      [
+        1.0,
+        1.0
+      ]
+    ]
+  },
+  "destination_quad_normalized": [
+    [
+      0.08,
+      0.08
+    ],
+    [
+      0.92,
+      0.08
+    ],
+    [
+      0.98,
+      0.98
+    ],
+    [
+      0.02,
+      0.98
+    ]
+  ],
+  "alignment": {
+    "mode": "quad",
+    "camera_horizon_y": 0.0,
+    "horizon_margin": 0.18,
+    "pan_x": 0,
+    "pan_y": 0,
+    "pairs": [],
+    "profiles": [],
+    "blend": 0.0,
+    "trim": {
+      "dx_px": 39.5,
+      "dy_px": -255.4,
+      "top_scale": 0.65,
+      "bottom_scale": 1.29
+    },
+    "trim_step": {
+      "fine": {
+        "move_px": 3.0,
+        "scale": 0.01
+      },
+      "coarse": {
+        "move_px": 25.0,
+        "scale": 0.05
+      }
+    }
+  },
+  "ui": {
+    "style": "ar_overlay"
+  },
+  "theme": {
+    "edge_width_ratio": 0.0148,
+    "alert_edge_width_ratio": 0.0296,
+    "dim_edge_width_ratio": 0.0111,
+    "boot_animation": true,
+    "state_bar": true,
+    "state_bar_height_ratio": 0.005,
+    "state_bar_margin_ratio": 0.03
+  }
+}
