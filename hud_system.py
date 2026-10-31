@@ -280,6 +280,123 @@ def _select_hud_lanes(
     return selected
 
 
+# ---------------------------------------------------------------------------
+# lanes 폴리라인 양끝 외삽
+#
+# 젯슨이 lanes 로 보내는 선은 커브에서 짧고 본넷 쪽이 비어 있어 HUD 에
+# 토막처럼 뜬다. 정규화 이미지 공간에서(정렬·trim 적용 전) 양끝을 곡률을
+# 따라 늘린다. 두 끝의 성격이 달라 비대칭으로 늘린다.
+#   가까운 쪽(y 큰 쪽): near_to 까지 제한 없이. 짧은 거리라 곡률이 거의
+#     안 변해 외삽이 잘 맞는다.
+#   먼 쪽(y 작은 쪽): 관측 길이의 far_ratio 만큼만. 앞쪽 곡률은 모르므로
+#     2차식을 멀리 늘리면 발산해 도로 밖으로 선이 뻗는다.
+# 2차식(left/right 계수) 폴백 경로는 이미 y_range 로 펴서 오므로 대상이 아니다.
+# ---------------------------------------------------------------------------
+
+LANE_EXTEND_DEFAULTS: dict[str, Any] = {
+    "enabled": True,
+    "near_to": 1.0,
+    "far_ratio": 0.25,
+    "min_points": 6,
+    "fit_points": 6,
+    "max_rms": 0.01,
+}
+# 생성한 점의 x 가 이 범위를 벗어나면 거기서 멈춘다
+LANE_EXTEND_X_LIMITS = (-0.5, 1.5)
+
+
+def lane_extend_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """display.lane_extend 를 기본값 위에 얹는다. 키가 없어도 동작한다."""
+    settings = dict(LANE_EXTEND_DEFAULTS)
+    raw = config.get("display", {}).get("lane_extend")
+    if isinstance(raw, dict):
+        settings.update(raw)
+    settings["enabled"] = bool(settings["enabled"])
+    for key in ("near_to", "far_ratio", "max_rms"):
+        settings[key] = float(settings[key])
+    # 2차식은 점 3개가 있어야 정해진다
+    settings["fit_points"] = max(3, int(settings["fit_points"]))
+    settings["min_points"] = max(settings["fit_points"], int(settings["min_points"]))
+    return settings
+
+
+def _extend_end(
+    fit_y: Any, fit_x: Any, target_y: float, max_rms: float
+) -> list[list[float]]:
+    """끝 점들(fit_y 의 마지막이 끝 점)로 x = f(y) 2차식을 맞춰 target_y 까지 편다.
+
+    돌려주는 점은 끝 점에서 바깥쪽 순서다. 끝 점 자체는 넣지 않는다.
+    """
+    import numpy as np
+
+    end_y = float(fit_y[-1])
+    span = target_y - end_y
+    gaps = np.abs(np.diff(fit_y))
+    step = float(np.median(gaps)) if gaps.size else 0.0
+    if step <= 1e-6 or abs(span) < step * 0.5:
+        return []
+    # 끝 점 기준으로 y 를 옮겨 맞춘다. 0~1 원좌표 그대로보다 조건수가 좋다.
+    rel_y = fit_y - end_y
+    if float(np.ptp(rel_y)) <= 1e-6:
+        return []
+    coefficients = np.polyfit(rel_y, fit_x, 2)
+    residual = fit_x - np.polyval(coefficients, rel_y)
+    # 노이즈에 곡선을 맞추면 엉뚱한 방향으로 뻗는다. 잘 안 맞으면 늘리지 않는다.
+    if float(np.sqrt(np.mean(residual * residual))) > max_rms:
+        return []
+
+    count = max(1, int(math.ceil(abs(span) / step - 1e-9)))
+    offsets = np.linspace(span / count, span, count)
+    xs = np.polyval(coefficients, offsets)
+    low, high = LANE_EXTEND_X_LIMITS
+    output: list[list[float]] = []
+    for offset, x in zip(offsets, xs):
+        if not (low <= x <= high):
+            break
+        output.append([round(float(x), 5), round(end_y + float(offset), 5)])
+    return output
+
+
+def extend_lane(lane: list[list[float]], settings: dict[str, Any]) -> list[list[float]]:
+    """정규화 폴리라인 하나의 양끝을 늘린다. y 는 먼 쪽 -> 가까운 쪽 오름차순."""
+    import numpy as np
+
+    if len(lane) < settings["min_points"]:
+        return lane
+    points = np.asarray(lane, dtype=np.float64)
+    order = np.argsort(points[:, 1], kind="stable")
+    points = points[order]
+    ys = points[:, 1]
+    xs = points[:, 0]
+    fit = settings["fit_points"]
+    min_y = float(ys[0])
+    max_y = float(ys[-1])
+
+    # 가까운 쪽: near_to 까지. 끝 점이 마지막이 되도록 정순 그대로 넘긴다.
+    near = _extend_end(ys[-fit:], xs[-fit:], settings["near_to"], settings["max_rms"])
+
+    # 먼 쪽: 관측 길이의 far_ratio 만큼. 이미지 위(y<0)로는 넘기지 않는다.
+    far_to = max(0.0, min_y - settings["far_ratio"] * (max_y - min_y))
+    far = _extend_end(ys[:fit][::-1], xs[:fit][::-1], far_to, settings["max_rms"])
+
+    if not near and not far:
+        return lane
+    original = [[float(x), float(y)] for x, y in points]
+    return far[::-1] + original + near
+
+
+def extend_lanes(
+    lanes: list[list[list[float]]],
+    settings: dict[str, Any],
+    *,
+    state: int = 0,
+) -> list[list[list[float]]]:
+    """lanes 패킷의 차선들을 늘린다. 꺼져 있거나 state 2 면 그대로 돌려준다."""
+    if not settings["enabled"] or not lanes or state == 2:
+        return lanes
+    return [extend_lane(lane, settings) for lane in lanes]
+
+
 class HudSender:
     """추론 코드에서 사용하는 HUD UDP 송신 어댑터."""
 
@@ -514,7 +631,9 @@ def _decode_packet(payload: bytes) -> dict[str, Any]:
         raise PacketError("packet must be an object")
     if packet.get("v", PROTOCOL_VERSION) != PROTOCOL_VERSION:
         raise PacketError("unsupported protocol version")
-    if _is_jetson_packet(packet):
+    # 파이 내부 표시. 2차식 계수를 펴서 만든 lanes 는 외삽 대상이 아니다.
+    packet["lanes_from_poly"] = _is_jetson_packet(packet)
+    if packet["lanes_from_poly"]:
         _adapt_jetson_packet(packet)
     sequence = packet.get("seq")
     if not isinstance(sequence, int) or sequence < 0:

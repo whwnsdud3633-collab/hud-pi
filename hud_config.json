@@ -28,6 +28,14 @@
     "association_distance": 0.18,
     "jump_gate_distance": 0.0,
     "jump_gate_frames": 3,
+    "lane_extend": {
+      "enabled": true,
+      "near_to": 1.0,
+      "far_ratio": 0.25,
+      "min_points": 6,
+      "fit_points": 6,
+      "max_rms": 0.01
+    },
     "edge_stops": [
       [
         0.0,

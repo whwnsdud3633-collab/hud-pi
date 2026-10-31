@@ -61,6 +61,8 @@ from hud_system import (
     _mock_lane,
     _select_hud_lanes,
     LaneSmoother,
+    extend_lanes,
+    lane_extend_settings,
     load_config,
     open_receiver,
     receive_latest,
@@ -920,6 +922,8 @@ class LaneFeed:
             jump_gate_distance=float(display.get("jump_gate_distance", 0.05)),
             jump_gate_frames=int(display.get("jump_gate_frames", 3)),
         )
+        # lanes 폴리라인 양끝 외삽. 끄면(enabled false) 예전과 똑같이 그린다.
+        self.lane_extend = lane_extend_settings(config)
         # 무수신 판정과 state 디바운싱은 전부 여기에 있다. 이 루프는 판정을
         # 하지 않고 결과만 받아 그린다.
         self.tracker = StateTracker(config)
@@ -959,6 +963,16 @@ class LaneFeed:
         if packet is None:
             return
         packet["lanes"] = self.smoother.update(packet["lanes"], packet.get("lane_ids"))
+        # 외삽은 스무딩 뒤에 한다. 스무딩은 슬롯별 필터라 점 개수가 흔들리면
+        # 안 되고, 외삽은 그리기 직전 정규화 공간에서 해야 정렬·trim 과 무관하다.
+        # 2차식 계수로 온 패킷은 이미 y_range 로 폈으므로 건드리지 않는다.
+        if not packet.get("lanes_from_poly"):
+            raw_state = normalize_state(packet.get("state", STATE_NORMAL))
+            if packet["status"] == "lost":
+                raw_state = STATE_LOST
+            packet["lanes"] = extend_lanes(
+                packet["lanes"], self.lane_extend, state=raw_state
+            )
         self.latest = packet
         self.latest_received = time.monotonic()
         self.last_sequence = packet["seq"]
@@ -1272,6 +1286,17 @@ def run_bench(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     renderer = make_renderer(config, args.theme)
     lanes = [_mock_lane(0.18, 0.43, 0.0), _mock_lane(0.82, 0.57, 0.3)]
+    # receive 와 같은 외삽을 거친 선으로 잰다. 외삽 자체는 패킷당 한 번이라
+    # 렌더와 따로 잰다.
+    extend = lane_extend_settings(config)
+    start = time.perf_counter()
+    for _ in range(args.frames):
+        extended = extend_lanes(lanes, extend)
+    extend_ms = (time.perf_counter() - start) / args.frames * 1000.0
+    points = "+".join(str(len(lane)) for lane in extended)
+    print(f"lane_extend {'on ' if extend['enabled'] else 'off'} "
+          f"{extend_ms:6.3f} ms/packet   points {points}")
+    lanes = extended
     telemetry = {"confidence": 0.7, "fps": 22.4, "inference_ms": 44.6,
                  "departure_distance": 0.3}
     # 부트 애니메이션이 도는 동안은 선이 짧아 측정이 후하게 나온다. 먼저 태운다.
