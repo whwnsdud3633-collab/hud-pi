@@ -1154,6 +1154,66 @@ class _ReceiveTrim:
         cv2.add(canvas, self._overlay, dst=canvas)
 
 
+# receive 중 [ ] 로 돌려 보는 원근 페이드 프리셋. 반사판에 띄워 두고 눈으로
+# 비교하려는 용도라 저장은 하지 않는다. 고른 값은 display.edge_stops 에 옮긴다.
+EDGE_STOP_PRESETS: list[tuple[str, list[list[float]]]] = [
+    ("current", [[0.0, 1.0], [0.62, 0.72], [1.0, 0.0]]),
+    ("floor 0.3", [[0.0, 1.0], [0.62, 0.80], [1.0, 0.30]]),
+    ("floor 0.5", [[0.0, 1.0], [0.62, 0.85], [1.0, 0.50]]),
+    ("uniform", [[0.0, 1.0], [1.0, 1.0]]),
+]
+
+
+class _ReceiveFadePresets:
+    """receive 실행 중 [ / ] 로 원근 페이드 프리셋을 순환한다.
+
+    키패드(trim) 와 겹치지 않는 키다. 시작 값은 설정의 edge_stops 이고,
+    프리셋 중 하나와 같으면 그 번호, 아니면 'config' 로 표시한다.
+    """
+
+    def __init__(self, renderer: Any) -> None:
+        self.renderer = renderer
+        self.mapper = renderer.mapper
+        self.enabled = hasattr(renderer, "set_edge_stops")
+        self.index: int | None = None
+        if self.enabled:
+            current = [list(stop) for stop in renderer.edge_stops]
+            for index, (_, stops) in enumerate(EDGE_STOP_PRESETS):
+                if stops == current:
+                    self.index = index
+        self._overlay_key: str | None = None
+        self._overlay: np.ndarray | None = None
+
+    def handle_key(self, key: int) -> bool:
+        if not self.enabled or key not in (ord("["), ord("]")):
+            return False
+        step = 1 if key == ord("]") else -1
+        if self.index is None:
+            self.index = 0 if step > 0 else len(EDGE_STOP_PRESETS) - 1
+        else:
+            self.index = (self.index + step) % len(EDGE_STOP_PRESETS)
+        name, stops = EDGE_STOP_PRESETS[self.index]
+        self.renderer.set_edge_stops(stops)
+        print(f"edge_stops preset {self.index} {name}: {json.dumps(stops)}")
+        return True
+
+    def draw(self, canvas: np.ndarray) -> None:
+        if not self.enabled:
+            return
+        if self.index is None:
+            text = "FADE config  [ ] preset"
+        else:
+            name, _ = EDGE_STOP_PRESETS[self.index]
+            text = f"FADE {self.index} {name}  [ ] preset"
+        if text != self._overlay_key or self._overlay is None:
+            self._overlay_key = text
+            # 첫 줄은 trim 표시 자리라 비워 두고 둘째 줄에 쓴다
+            self._overlay = _overlay(self.mapper.width, self.mapper.height,
+                                     [("", OVERLAY_COLOR), (text, OVERLAY_COLOR)],
+                                     self.mapper.physical_flip_horizontal)
+        cv2.add(canvas, self._overlay, dst=canvas)
+
+
 def run_receive(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     ensure_ui_config(config)
@@ -1172,8 +1232,9 @@ def run_receive(args: argparse.Namespace) -> None:
     started = time.monotonic()
     stats = _LatencyStats(feed) if args.stats else None
     trim = _ReceiveTrim(config, args.config, renderer)
+    fade = _ReceiveFadePresets(renderer)
     print("keypad trim: 8/2/4/6 move, 7/9 top width, 1/3 bottom width, / - both, 0/f/tab step, "
-          "* reset, 5/enter/+ save. q/esc quit")
+          "* reset, 5/enter/+ save. [ ] fade preset. q/esc quit")
 
     try:
         while True:
@@ -1187,10 +1248,11 @@ def run_receive(args: argparse.Namespace) -> None:
                 stats.add(now, frame_args["debug"])
 
             trim.draw(canvas)
+            fade.draw(canvas)
             cv2.imshow(name, canvas)
             # 키패드 숫자는 언제나 trim 키다. 나머지는 원래 처리로 간다
             key = cv2.waitKeyEx(1)
-            if trim.handle_key(key):
+            if trim.handle_key(key) or fade.handle_key(key):
                 continue
             if key in (27, ord("q")):
                 break

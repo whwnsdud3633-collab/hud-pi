@@ -41,6 +41,8 @@ HORIZON_Y = 172.0
 
 ALERT = (61, 77, 255)        # #ff4d3d BGR
 
+# 원근 페이드 기본값. display.edge_stops 가 있으면 그쪽을 쓴다.
+# (t, 밝기) 쌍이고 t 는 근거리 0 -> 원거리 1.
 EDGE_STOPS = ((0.0, 1.0), (0.62, 0.72), (1.0, 0.0))
 DIM_STOPS = ((0.0, 0.34), (0.70, 0.12), (1.0, 0.0))
 ALERT_EDGE_STOPS = ((0.0, 1.0), (0.62, 0.70), (1.0, 0.0))
@@ -70,6 +72,25 @@ def normalize_state(value: Any) -> int:
     except (TypeError, ValueError):
         return STATE_NORMAL
     return state if state in LANE_STATES else STATE_NORMAL
+
+
+def parse_edge_stops(value: Any) -> tuple[tuple[float, float], ...]:
+    """설정의 edge_stops 를 검사해 (t, 밝기) 튜플로. 이상하면 기본값.
+
+    t 는 0~1 오름차순이어야 하고 점이 둘 이상이어야 np.interp 가 뜻대로 돈다.
+    """
+    if value is None:
+        return EDGE_STOPS
+    try:
+        stops = tuple((float(t), float(v)) for t, v in value)
+    except (TypeError, ValueError):
+        stops = ()
+    ts = [t for t, _ in stops]
+    if (len(stops) < 2 or ts != sorted(ts) or ts[0] < 0.0 or ts[-1] > 1.0
+            or any(not 0.0 <= v <= 1.0 for _, v in stops)):
+        print(f"warning: display.edge_stops {value!r} is invalid; using default {EDGE_STOPS}")
+        return EDGE_STOPS
+    return stops
 
 
 def _build_ramp(height: int, near_y: float, far_y: float, stops) -> np.ndarray:
@@ -128,8 +149,12 @@ class ThemeRenderer:
         self.offset_x = (self.width - DESIGN_W * self.scale) / 2.0
         self.offset_y = (self.height - DESIGN_H * self.scale) / 2.0
 
+        self.edge_stops = parse_edge_stops(display.get("edge_stops"))
         self._ramp_range = (-1.0, -1.0)
         self.ramps: dict[str, np.ndarray] = {}
+        # 디버그용. 마지막 프레임에 차선별 패널 y 범위. 투영 직후(proj) 와
+        # 실제로 그린 것(draw) 을 따로 둬서 어디서 잘리는지 본다.
+        self.lane_y_debug: dict[str, tuple[int, int]] = {}
         near, far = self._dy(DESIGN_H), self._dy(HORIZON_Y)
         if self.mapper.flip_vertical:
             near, far = self.height - 1 - near, self.height - 1 - far
@@ -153,9 +178,17 @@ class ThemeRenderer:
         if abs(near - self._ramp_range[0]) < 2 and abs(far - self._ramp_range[1]) < 2:
             return
         self._ramp_range = (near, far)
-        for name, stops in (("edge", EDGE_STOPS), ("dim", DIM_STOPS),
+        for name, stops in (("edge", self.edge_stops), ("dim", DIM_STOPS),
                             ("alert_edge", ALERT_EDGE_STOPS)):
             self.ramps[name] = _build_ramp(self.height, near, far, stops)
+
+    def set_edge_stops(self, stops: Any) -> None:
+        """실행 중에 원근 페이드를 바꾼다. rebuild() 와 달리 부트 애니메이션을
+        다시 틀지 않는다. 램프는 다음 프레임에 새 값으로 다시 만들어진다."""
+        self.edge_stops = parse_edge_stops(stops)
+        near, far = self._ramp_range
+        self._ramp_range = (-1.0, -1.0)
+        self._update_ramps(near, far)
 
     @property
     def calibrated(self) -> bool:
@@ -234,7 +267,9 @@ class ThemeRenderer:
 
     # 차선 --------------------------------------------------------------
 
-    def _project_lane(self, lane: Any) -> np.ndarray | None:
+    def _project_lane(
+        self, lane: Any, proj_range: list | None = None
+    ) -> np.ndarray | None:
         """차선을 패널 픽셀로. 점 순서는 근거리 -> 원거리다.
 
         순서는 투영 전에 카메라 y 로 정한다. 카메라 영상에서는 아래(y 큰
@@ -249,6 +284,8 @@ class ThemeRenderer:
         if valid.sum() < 2:
             return None
         points = points[valid]
+        if proj_range is not None:
+            proj_range.append((int(points[:, 1].min()), int(points[:, 1].max())))
         # 패널 좌우로 빠져나간 근거리 구간은 리본에서 뺀다. 그대로 두면
         # 채움이 화면 아래쪽을 통째로 덮어 시야를 가린다. 다만 점만 걷어
         # 내면 경계에서 선이 뚝 끊기므로 경계와의 교점을 끼워 넣는다.
@@ -258,6 +295,19 @@ class ThemeRenderer:
         if len(inside) < 2:
             return None
         return np.rint(np.asarray(inside, dtype=np.float64)).astype(np.int32)
+
+    def _record_lane_y(self, left, right, proj_ranges) -> None:
+        """디버그 오버레이용 y 범위. proj 는 투영 직후 전체 차선의 합,
+        draw 는 좌우 클립·원거리 교차 자르기까지 거친 실제 획이다."""
+        info: dict[str, Any] = {}
+        if proj_ranges:
+            info["proj"] = (min(r[0] for r in proj_ranges),
+                            max(r[1] for r in proj_ranges))
+        for side, points in (("L", left), ("R", right)):
+            if points is not None:
+                ys = points[:, 1]
+                info[side] = (int(ys.min()), int(ys.max()))
+        self.lane_y_debug = info
 
     def _edge_width(self, side: str, departure_side: str | None) -> int:
         """차선 한쪽을 그릴 굵기. 이탈 쪽은 굵게, 반대쪽은 가늘게."""
@@ -470,7 +520,8 @@ class ThemeRenderer:
                 age = time.monotonic() - self.started
                 boot = float(np.clip(age / 1.2, 0.0, 1.0))
 
-            projected = [self._project_lane(lane) for lane in lanes]
+            proj_ranges: list = []
+            projected = [self._project_lane(lane, proj_ranges) for lane in lanes]
             projected = [p for p in projected if p is not None]
             left = right = None
             if len(projected) >= 2:
@@ -487,9 +538,12 @@ class ThemeRenderer:
                 min_gap = max(self._edge_width("left", departure_side),
                               self._edge_width("right", departure_side))
                 left, right = self._trim_far_contact(left, right, min_gap)
+            self._record_lane_y(left, right, proj_ranges)
 
             self._draw_ribbon(left, right, departure_side, elapsed,
                               self.lane_state, boot, self.lane_opacity)
+        else:
+            self.lane_y_debug = {}
         self._draw_state_bar()
 
         frame = self._compose()
@@ -506,6 +560,15 @@ class ThemeRenderer:
                     "--" if lag is None else f"{lag:.0f}ms",
                     "--" if queue is None else f"{queue:.0f}ms",
                     debug.get("skipped", 0), debug.get("dropped", 0)))
+            # 차선의 패널 y 범위 (위 / 아래). 0 ~ H-1 밖이면 화면에서 잘린다
+            yinfo = self.lane_y_debug
+
+            def yr(key: str) -> str:
+                r = yinfo.get(key)
+                return "--" if r is None else f"{r[0]}..{r[1]}"
+
+            lines.append(f"Y proj {yr('proj')}  L {yr('L')}  R {yr('R')}  "
+                         f"panel 0..{self.height - 1}")
             line_h = int(28 * text_scale) + 6
             for index, line in enumerate(reversed(lines)):
                 cv2.putText(frame, line, (12, self.height - 12 - index * line_h),
