@@ -63,6 +63,8 @@ from hud_system import (
     LaneSmoother,
     extend_lanes,
     lane_extend_settings,
+    lane_lead_settings,
+    LaneLead,
     load_config,
     open_receiver,
     receive_latest,
@@ -913,7 +915,14 @@ class LaneFeed:
     둔다. 두 곳이 따로 판정하면 보정할 때 본 화면과 주행 때 화면이 달라진다.
     """
 
-    def __init__(self, config: dict[str, Any], bind_host: str, port: int) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        bind_host: str,
+        port: int,
+        *,
+        config_path: Path | None = None,
+    ) -> None:
         ensure_state_config(config)
         display = config["display"]
         self.smoother = LaneSmoother(
@@ -927,6 +936,12 @@ class LaneFeed:
         # 참이면 젯슨이 lanes 를 보내도 버리고 left/right 2차식 계수로 그린다.
         # A/B 비교, 발표 중 예전 방식으로 즉시 되돌리기용. 키가 없으면 거짓.
         self.ignore_lanes = bool(display.get("ignore_lanes", False))
+        # 가로 이동 예측. display.lead 가 없으면 꺼져 있다.
+        # 값을 바꿔 가며 맞추므로 config_path 를 주면 파일이 바뀔 때 다시 읽는다.
+        self.lead = LaneLead(lane_lead_settings(config))
+        self._config_path = config_path
+        self._config_mtime = self._read_mtime()
+        self._config_checked = time.monotonic()
         # 무수신 판정과 state 디바운싱은 전부 여기에 있다. 이 루프는 판정을
         # 하지 않고 결과만 받아 그린다.
         self.tracker = StateTracker(config)
@@ -953,6 +968,35 @@ class LaneFeed:
     def close(self) -> None:
         self.socket.close()
 
+    def _read_mtime(self) -> float | None:
+        if self._config_path is None:
+            return None
+        try:
+            return self._config_path.stat().st_mtime
+        except OSError:
+            return None
+
+    def _reload_lead(self) -> None:
+        """설정 파일이 바뀌었으면 display.lead 만 다시 읽는다. 0.5초에 한 번 본다."""
+        now = time.monotonic()
+        if self._config_path is None or now - self._config_checked < 0.5:
+            return
+        self._config_checked = now
+        mtime = self._read_mtime()
+        if mtime is None or mtime == self._config_mtime:
+            return
+        try:
+            settings = lane_lead_settings(load_config(self._config_path))
+        except (OSError, ValueError, TypeError):
+            # 편집기가 쓰는 도중일 수 있다. 다음에 다시 본다.
+            return
+        self._config_mtime = mtime
+        if settings != self.lead.settings:
+            self.lead.set_settings(settings)
+            print(f"lead {'on ' if settings['enabled'] else 'off'} "
+                  f"lead_ms {settings['lead_ms']:g}  max_shift {settings['max_shift']:g}"
+                  f"  history {settings['history']}")
+
     def poll(self, timeout: float) -> None:
         """쌓인 패킷을 전부 꺼내 가장 최근 것만 쓴다. 없으면 timeout 만큼 기다린다."""
         packet, skipped, invalid, address = receive_latest(
@@ -966,6 +1010,13 @@ class LaneFeed:
         if packet is None:
             return
         packet["lanes"] = self.smoother.update(packet["lanes"], packet.get("lane_ids"))
+        # 가로 이동 예측은 스무딩 다음, 외삽 이전. 스무딩 전 값으로 속도를 재면
+        # 검출 노이즈가 그대로 속도에 실리고, 외삽 뒤에 하면 지어낸 점까지 민다.
+        self._reload_lead()
+        sent_at = packet.get("sent_at")
+        stamp = float(sent_at) if isinstance(sent_at, (int, float)) and math.isfinite(sent_at) \
+            else time.monotonic()
+        packet["lanes"] = self.lead.update(packet["lanes"], packet.get("lane_ids"), stamp)
         # 외삽은 스무딩 뒤에 한다. 스무딩은 슬롯별 필터라 점 개수가 흔들리면
         # 안 되고, 외삽은 그리기 직전 정규화 공간에서 해야 정렬·trim 과 무관하다.
         # 2차식 계수로 온 패킷은 이미 y_range 로 폈으므로 near_anchor 맞추기만
@@ -1005,6 +1056,7 @@ class LaneFeed:
             # 송신기가 재시작해 seq 가 0 으로 돌아와도 다시 받아들인다.
             self.last_sequence = -1
             self.smoother.reset()
+            self.lead.reset()
             # 송신기가 바뀌었을 수 있으니 시계 기준선도 다시 잡는다
             self.lag_floor_ms = None
 
@@ -1241,7 +1293,7 @@ def run_receive(args: argparse.Namespace) -> None:
 
     bind_host = args.bind_host or str(network["bind_host"])
     port = args.port or int(network["port"])
-    feed = LaneFeed(config, bind_host, port)
+    feed = LaneFeed(config, bind_host, port, config_path=args.config)
 
     name = str(display["window_name"])
     _open_window(name, renderer, args.windowed, bool(display["fullscreen"]))
@@ -1302,6 +1354,16 @@ def run_bench(args: argparse.Namespace) -> None:
           f"{extend_ms:6.3f} ms/packet   points {points}"
           f"   near_anchor {extend['near_anchor']:.2f}")
     lanes = extended
+    # 가로 이동 예측도 패킷당 한 번이다. 꺼져 있어도 켠 상태 값으로 잰다.
+    lead_settings = lane_lead_settings(config)
+    lead = LaneLead(dict(lead_settings, enabled=True,
+                         lead_ms=lead_settings["lead_ms"] or 100.0))
+    start = time.perf_counter()
+    for index in range(args.frames):
+        lead.update(lanes, [1, 3], index / 30.0)
+    lead_ms = (time.perf_counter() - start) / args.frames * 1000.0
+    print(f"lead         {'on ' if lead_settings['enabled'] else 'off'} "
+          f"{lead_ms:6.3f} ms/packet")
     telemetry = {"confidence": 0.7, "fps": 22.4, "inference_ms": 44.6,
                  "departure_distance": 0.3}
     # 부트 애니메이션이 도는 동안은 선이 짧아 측정이 후하게 나온다. 먼저 태운다.

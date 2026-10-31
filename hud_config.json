@@ -49,7 +49,13 @@
         1.0,
         1.0
       ]
-    ]
+    ],
+    "lead": {
+      "enabled": true,
+      "lead_ms": 100,
+      "max_shift": 0.06,
+      "history": 6
+    }
   },
   "destination_quad_normalized": [
     [

@@ -397,7 +397,7 @@ def run_trim(args: argparse.Namespace) -> None:
         network = config["network"]
         bind_host = args.bind_host or str(network["bind_host"])
         port = args.port or int(network["port"])
-        feed = LaneFeed(config, bind_host, port)
+        feed = LaneFeed(config, bind_host, port, config_path=args.config)
         source_label = f"UDP {port}"
         print(f"listening on {bind_host}:{port}. stop 'hud_ui.py receive' first "
               f"if it is running, or it will take the packets.")

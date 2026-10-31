@@ -486,6 +486,156 @@ def extend_lanes(
     return extended
 
 
+# ---------------------------------------------------------------------------
+# 가로 이동 예측 (display.lead)
+#
+# 커브에서 HUD 선이 도로보다 커브 반대쪽에 남는다. 파이프라인 지연(추론
+# ~45ms + 스무딩 + 렌더 + 출력) 동안 차선이 가로로 쓸려가는데 과거 위치를
+# 그리기 때문이다. 직선에서는 가로 이동이 없어 안 보인다.
+# 선마다 기준 y 에서의 x 를 패킷 시각과 함께 몇 개 쌓아 최소제곱으로 dx/dt 를
+# 구하고, lead_ms 만큼 앞으로 민다. 선 전체에 같은 shift 를 더한다.
+# 스무딩 다음, 외삽 이전에 건다 (LaneFeed.poll).
+# ---------------------------------------------------------------------------
+
+LANE_LEAD_DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "lead_ms": 100.0,
+    "max_shift": 0.06,
+    "history": 6,
+}
+# 속도 추정에 필요한 최소 샘플 수
+LANE_LEAD_MIN_SAMPLES = 3
+# 샘플 사이가 이보다 벌어지면(차선을 잠깐 놓쳤다 다시 잡음) 이력을 버린다.
+# 옛 위치와 이으면 그 사이 움직임이 한 번에 속도로 잡힌다.
+LANE_LEAD_MAX_GAP_SECONDS = 0.5
+
+
+def lane_lead_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """display.lead 를 기본값 위에 얹는다. 키가 없으면 꺼져 있다."""
+    settings = dict(LANE_LEAD_DEFAULTS)
+    raw = config.get("display", {}).get("lead")
+    if isinstance(raw, dict):
+        settings.update(raw)
+    settings["enabled"] = bool(settings["enabled"])
+    settings["lead_ms"] = float(settings["lead_ms"])
+    settings["max_shift"] = abs(float(settings["max_shift"]))
+    settings["history"] = max(LANE_LEAD_MIN_SAMPLES, int(settings["history"]))
+    return settings
+
+
+class LaneLead:
+    """선마다 가로 속도를 추정해 lead_ms 뒤 위치로 민다.
+
+    선 구분은 트랙 id 로 한다. id 가 바뀌면(차선 변경) 다른 선이므로 이력을
+    버린다. 안 그러면 옆 차선 x 로 넘어가는 순간이 큰 가짜 속도로 잡힌다.
+    id 가 없으면(mock, 예전 송신기) (자리 번호, 선 개수) 로 구분해 개수가
+    바뀌면 다시 쌓는다.
+
+    기준 y 는 이력을 시작할 때 관측 구간 중앙으로 잡고 그 이력 동안 고정한다.
+    매번 중앙을 다시 잡으면 본넷 때문에 구간이 줄었다 늘었다 할 때 기울어진
+    선 위의 다른 점을 보게 되어 가짜 속도가 생긴다. 기준 y 가 관측 구간을
+    벗어나면 이력을 버리고 새로 잡는다.
+    """
+
+    def __init__(self, settings: dict[str, Any]) -> None:
+        self.settings = settings
+        # 키 -> {"ref_y": float, "samples": [(t, x), ...]}
+        self.tracks: dict[Any, dict[str, Any]] = {}
+        # 마지막으로 민 양 (정규화 x). 디버그 표시용
+        self.shifts: list[float] = []
+
+    def reset(self) -> None:
+        self.tracks = {}
+        self.shifts = []
+
+    def set_settings(self, settings: dict[str, Any]) -> None:
+        """실행 중에 값을 바꾼다. 이력은 살려 두고 길이만 맞춘다."""
+        self.settings = settings
+        for track in self.tracks.values():
+            del track["samples"][: -settings["history"]]
+
+    def _velocity(self, samples: list[tuple[float, float]]) -> float:
+        n = len(samples)
+        mean_t = sum(t for t, _ in samples) / n
+        mean_x = sum(x for _, x in samples) / n
+        var = sum((t - mean_t) ** 2 for t, _ in samples)
+        if var <= 1e-12:
+            return 0.0
+        return sum((t - mean_t) * (x - mean_x) for t, x in samples) / var
+
+    def update(
+        self,
+        lanes: list[list[list[float]]],
+        lane_ids: list[Any] | None,
+        timestamp: float,
+    ) -> list[list[list[float]]]:
+        settings = self.settings
+        if not settings["enabled"] or settings["lead_ms"] == 0.0:
+            # 꺼 둔 동안 이력이 남아 있으면 다시 켤 때 옛 샘플과 이어진다
+            self.reset()
+            return lanes
+        import numpy as np
+
+        lead_seconds = settings["lead_ms"] / 1000.0
+        limit = settings["max_shift"]
+        seen: dict[Any, dict[str, Any]] = {}
+        output: list[list[list[float]]] = []
+        self.shifts = []
+        for index, lane in enumerate(lanes):
+            lane_id = lane_ids[index] if lane_ids and index < len(lane_ids) else None
+            key = ("id", lane_id) if lane_id is not None else ("slot", index, len(lanes))
+            if key in seen or len(lane) < 2:
+                # 같은 id 가 둘이면 어느 쪽 이력인지 모른다. 밀지 않는다.
+                output.append(lane)
+                self.shifts.append(0.0)
+                continue
+
+            points = np.asarray(lane, dtype=np.float64)
+            order = np.argsort(points[:, 1], kind="stable")
+            ys = points[order, 1]
+            xs = points[order, 0]
+            low, high = float(ys[0]), float(ys[-1])
+
+            track = self.tracks.get(key)
+            if track is not None:
+                last_t = track["samples"][-1][0]
+                if (not (low <= track["ref_y"] <= high)
+                        or timestamp < last_t
+                        or timestamp - last_t > LANE_LEAD_MAX_GAP_SECONDS):
+                    track = None
+            if track is None:
+                track = {"ref_y": (low + high) * 0.5, "samples": []}
+            seen[key] = track
+
+            x_ref = float(np.interp(track["ref_y"], ys, xs))
+            samples = track["samples"]
+            if samples and samples[-1][0] == timestamp:
+                samples[-1] = (timestamp, x_ref)
+            else:
+                samples.append((timestamp, x_ref))
+            del samples[: -settings["history"]]
+
+            shift = 0.0
+            if len(samples) >= LANE_LEAD_MIN_SAMPLES:
+                shift = self._velocity(samples) * lead_seconds
+                shift = max(-limit, min(limit, shift))
+            self.shifts.append(shift)
+            if shift == 0.0:
+                output.append(lane)
+            else:
+                output.append([[round(x + shift, 5), y] for x, y in lane])
+        # 이번 패킷에 없는 선은 잠깐 놓친 것일 수 있어 이력을 남긴다.
+        # 간격이 LANE_LEAD_MAX_GAP_SECONDS 를 넘은 이력만 버린다.
+        kept = {
+            key: track for key, track in self.tracks.items()
+            if key not in seen
+            and 0.0 <= timestamp - track["samples"][-1][0] <= LANE_LEAD_MAX_GAP_SECONDS
+        }
+        kept.update(seen)
+        self.tracks = kept
+        return output
+
+
 class HudSender:
     """추론 코드에서 사용하는 HUD UDP 송신 어댑터."""
 
