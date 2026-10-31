@@ -284,25 +284,35 @@ def _select_hud_lanes(
 # lanes 폴리라인 양끝 외삽
 #
 # 젯슨이 lanes 로 보내는 선은 커브에서 짧고 본넷 쪽이 비어 있어 HUD 에
-# 토막처럼 뜬다. 정규화 이미지 공간에서(정렬·trim 적용 전) 양끝을 곡률을
-# 따라 늘린다. 두 끝의 성격이 달라 비대칭으로 늘린다.
-#   가까운 쪽(y 큰 쪽): near_to 까지 제한 없이. 짧은 거리라 곡률이 거의
-#     안 변해 외삽이 잘 맞는다.
-#   먼 쪽(y 작은 쪽): 관측 길이의 far_ratio 만큼만. 앞쪽 곡률은 모르므로
-#     2차식을 멀리 늘리면 발산해 도로 밖으로 선이 뻗는다.
+# 토막처럼 뜬다. 정규화 이미지 공간에서(정렬·trim 적용 전) 양끝을 늘린다.
+#   맞춤 차수(fit_degree): 기본 1차(직선). 이미지 공간에서 가까운 쪽 차선은
+#     원래 거의 직선이고 휨은 소실점 근처에 몰려 있다. 끝 몇 점이 차지하는
+#     y 범위가 좁아 2차항은 거의 노이즈로 정해지고, 그걸 멀리 늘리면 오차가
+#     제곱으로 커져 끝이 갈고리처럼 말린다. 2 로 두면 예전 2차 외삽.
+#   가까운 쪽(y 큰 쪽): near_to 까지.
+#   먼 쪽(y 작은 쪽): 관측 길이의 far_ratio 만큼만. 0 이면 늘리지 않는다
+#     (소실점을 넘어 두 선이 교차하는 경우가 있었다).
+#   한쪽 끝에서 늘리는 y 거리는 min(관측 길이 × 0.6, max_extend) 로 막는다.
+#     검출이 짧을 때 화면 절반을 지어내지 않게.
 # 2차식(left/right 계수) 폴백 경로는 이미 y_range 로 펴서 오므로 대상이 아니다.
 # ---------------------------------------------------------------------------
 
 LANE_EXTEND_DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "near_to": 1.0,
-    "far_ratio": 0.25,
+    "far_ratio": 0.0,
     "min_points": 6,
-    "fit_points": 6,
-    "max_rms": 0.01,
+    "fit_points": 8,
+    "fit_degree": 1,
+    "max_rms": 0.02,
+    "max_extend": 0.30,
 }
 # 생성한 점의 x 가 이 범위를 벗어나면 거기서 멈춘다
 LANE_EXTEND_X_LIMITS = (-0.5, 1.5)
+# 맞춤에 쓰는 최소 점 수. 이보다 적으면 외삽하지 않는다
+LANE_EXTEND_MIN_FIT = 4
+# 한쪽 끝에서 늘리는 거리의 상한 (관측 y 길이 대비)
+LANE_EXTEND_OBSERVED_RATIO = 0.6
 
 
 def lane_extend_settings(config: dict[str, Any]) -> dict[str, Any]:
@@ -312,18 +322,21 @@ def lane_extend_settings(config: dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw, dict):
         settings.update(raw)
     settings["enabled"] = bool(settings["enabled"])
-    for key in ("near_to", "far_ratio", "max_rms"):
+    for key in ("near_to", "far_ratio", "max_rms", "max_extend"):
         settings[key] = float(settings[key])
-    # 2차식은 점 3개가 있어야 정해진다
-    settings["fit_points"] = max(3, int(settings["fit_points"]))
-    settings["min_points"] = max(settings["fit_points"], int(settings["min_points"]))
+    settings["fit_degree"] = 2 if int(settings["fit_degree"]) >= 2 else 1
+    # 점이 fit_points 보다 적으면 있는 만큼 쓴다. 다만 LANE_EXTEND_MIN_FIT 미만은 안 늘린다
+    settings["fit_points"] = max(LANE_EXTEND_MIN_FIT, int(settings["fit_points"]))
+    settings["min_points"] = max(LANE_EXTEND_MIN_FIT, int(settings["min_points"]))
     return settings
 
 
 def _extend_end(
-    fit_y: Any, fit_x: Any, target_y: float, max_rms: float
+    fit_y: Any, fit_x: Any, target_y: float, max_rms: float, degree: int
 ) -> list[list[float]]:
-    """끝 점들(fit_y 의 마지막이 끝 점)로 x = f(y) 2차식을 맞춰 target_y 까지 편다.
+    """끝 점들(fit_y 의 마지막이 끝 점)로 x = f(y) 를 degree 차로 맞춰 target_y 까지 편다.
+
+    잔차 RMS 는 맞춘 차수 기준이다(1차면 직선 잔차).
 
     돌려주는 점은 끝 점에서 바깥쪽 순서다. 끝 점 자체는 넣지 않는다.
     """
@@ -339,7 +352,7 @@ def _extend_end(
     rel_y = fit_y - end_y
     if float(np.ptp(rel_y)) <= 1e-6:
         return []
-    coefficients = np.polyfit(rel_y, fit_x, 2)
+    coefficients = np.polyfit(rel_y, fit_x, degree)
     residual = fit_x - np.polyval(coefficients, rel_y)
     # 노이즈에 곡선을 맞추면 엉뚱한 방향으로 뻗는다. 잘 안 맞으면 늘리지 않는다.
     if float(np.sqrt(np.mean(residual * residual))) > max_rms:
@@ -368,16 +381,26 @@ def extend_lane(lane: list[list[float]], settings: dict[str, Any]) -> list[list[
     points = points[order]
     ys = points[:, 1]
     xs = points[:, 0]
-    fit = settings["fit_points"]
+    fit = min(settings["fit_points"], len(points))
+    if fit < LANE_EXTEND_MIN_FIT:
+        return lane
+    degree = settings["fit_degree"]
+    max_rms = settings["max_rms"]
     min_y = float(ys[0])
     max_y = float(ys[-1])
+    observed = max_y - min_y
+    limit = min(observed * LANE_EXTEND_OBSERVED_RATIO, settings["max_extend"])
 
-    # 가까운 쪽: near_to 까지. 끝 점이 마지막이 되도록 정순 그대로 넘긴다.
-    near = _extend_end(ys[-fit:], xs[-fit:], settings["near_to"], settings["max_rms"])
+    # 가까운 쪽: near_to 까지, 단 limit 이내. 끝 점이 마지막이 되도록 정순 그대로 넘긴다.
+    near_to = min(settings["near_to"], max_y + limit)
+    near = _extend_end(ys[-fit:], xs[-fit:], near_to, max_rms, degree)
 
-    # 먼 쪽: 관측 길이의 far_ratio 만큼. 이미지 위(y<0)로는 넘기지 않는다.
-    far_to = max(0.0, min_y - settings["far_ratio"] * (max_y - min_y))
-    far = _extend_end(ys[:fit][::-1], xs[:fit][::-1], far_to, settings["max_rms"])
+    # 먼 쪽: 관측 길이의 far_ratio 만큼(limit 이내). 0 이면 건너뛴다.
+    # 이미지 위(y<0)로는 넘기지 않는다.
+    far: list[list[float]] = []
+    if settings["far_ratio"] > 0.0:
+        far_to = max(0.0, min_y - min(settings["far_ratio"] * observed, limit))
+        far = _extend_end(ys[:fit][::-1], xs[:fit][::-1], far_to, max_rms, degree)
 
     if not near and not far:
         return lane

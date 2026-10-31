@@ -31,10 +31,12 @@
     "lane_extend": {
       "enabled": true,
       "near_to": 1.0,
-      "far_ratio": 0.25,
+      "far_ratio": 0.0,
       "min_points": 6,
-      "fit_points": 6,
-      "max_rms": 0.01
+      "fit_points": 8,
+      "fit_degree": 1,
+      "max_rms": 0.02,
+      "max_extend": 0.3
     },
     "edge_stops": [
       [
