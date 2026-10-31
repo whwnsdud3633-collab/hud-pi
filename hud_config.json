@@ -11,8 +11,8 @@
     "fall_frames": 5
   },
   "display": {
-    "width": 1920,
-    "height": 1200,
+    "width": 1280,
+    "height": 800,
     "fullscreen": true,
     "window_name": "Rain Lane HUD",
     "line_thickness": 8,
@@ -57,10 +57,10 @@
     "profiles": [],
     "blend": 0.0,
     "trim": {
-      "dx_px": 9.0,
-      "dy_px": -339.0,
-      "top_scale": 1.22238,
-      "bottom_scale": 1.09
+      "dx_px": 117.0,
+      "dy_px": -228.9,
+      "top_scale": 0.5,
+      "bottom_scale": 0.94
     },
     "trim_step": {
       "fine": {
