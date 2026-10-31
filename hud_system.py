@@ -904,13 +904,18 @@ def run_calibration(args: argparse.Namespace) -> None:
     cv2.destroyAllWindows()
 
 
-def _mock_lane(bottom_x: float, top_x: float, phase: float, count: int = 24) -> list[list[float]]:
+def _mock_lane(
+    bottom_x: float, top_x: float, phase: float, count: int = 24, curve: float = 0.0
+) -> list[list[float]]:
+    """curve 는 원거리 끝의 가로 휨(정규화 x). 근거리 0 에서 원거리로 갈수록
+    제곱으로 커진다. + 면 오른쪽 커브, - 면 왼쪽 커브."""
     output = []
     for index in range(count):
         y = 0.38 + 0.60 * index / (count - 1)
         progress = (y - 0.38) / 0.60
         x = top_x + (bottom_x - top_x) * progress**1.45
         x += 0.012 * math.sin(phase + progress * 2.2)
+        x += curve * (1.0 - progress) ** 2
         output.append([min(1.0, max(0.0, x)), y])
     return output
 
@@ -925,16 +930,20 @@ def run_mock_sender(args: argparse.Namespace) -> None:
             elapsed = time.monotonic() - started
             lane_change = bool(args.cycle and int(elapsed / 6) % 2)
             phase = elapsed * 0.8
+            curve = args.curve
+            if args.curve_period > 0:
+                # 좌우 커브를 번갈아. 페이드 비교 중에 양쪽 휨을 다 보려는 용도
+                curve *= math.sin(2.0 * math.pi * elapsed / args.curve_period)
             if lane_change:
                 lanes = [
-                    _mock_lane(0.14, 0.42, phase),
-                    _mock_lane(0.50, 0.54, phase + 0.2),
-                    _mock_lane(0.86, 0.68, phase + 0.4),
+                    _mock_lane(0.14, 0.42, phase, curve=curve),
+                    _mock_lane(0.50, 0.54, phase + 0.2, curve=curve),
+                    _mock_lane(0.86, 0.68, phase + 0.4, curve=curve),
                 ]
             else:
                 lanes = [
-                    _mock_lane(0.18, 0.43, phase),
-                    _mock_lane(0.82, 0.57, phase + 0.3),
+                    _mock_lane(0.18, 0.43, phase, curve=curve),
+                    _mock_lane(0.82, 0.57, phase + 0.3, curve=curve),
                 ]
             sender.send_normalized(
                 lanes,
@@ -971,6 +980,10 @@ def build_parser() -> argparse.ArgumentParser:
     mock_parser.add_argument("--destination", default="127.0.0.1:5005")
     mock_parser.add_argument("--fps", type=float, default=22.0)
     mock_parser.add_argument("--cycle", action="store_true", help="6초마다 일반/차선 변경 전환")
+    mock_parser.add_argument("--curve", type=float, default=0.0,
+                             help="원거리 끝 가로 휨(정규화 x). 0.15 정도면 뚜렷. 음수는 왼쪽")
+    mock_parser.add_argument("--curve-period", type=float, default=0.0,
+                             help="0 보다 크면 이 주기(초)로 좌우 커브를 번갈아")
     return parser
 
 
