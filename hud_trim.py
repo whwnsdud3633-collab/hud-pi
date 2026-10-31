@@ -39,6 +39,8 @@ from hud_system import _mock_lane, load_config, save_config
 
 MOVE, SCALE = "move", "scale"
 RESET, SAVE, QUIT, TOGGLE_STEP, SET = "reset", "save", "quit", "toggle_step", "set"
+# * 를 이 시간 안에 두 번 누르면 저장값이 아니라 0 으로 리셋한다
+RESET_ZERO_SECONDS = 1.5
 SAVE_QUIT = "save_quit"
 OTHER = "other"     # 뜻 없는 입력. 종료 확인을 취소하는 데만 쓰인다
 
@@ -100,9 +102,14 @@ class TrimAdjuster:
         height: int,
         on_change: Callable[[TrimParams], None],
         on_save: Callable[[TrimParams], None],
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.trim = trim
+        # 마지막 저장값. 시작 시 설정 파일 값이고 저장할 때마다 바뀐다. * 가 여기로 돌아간다
         self.saved = trim
+        self._clock = clock
+        # 직전 * 를 누른 시각. RESET_ZERO_SECONDS 안에 또 누르면 0 으로 간다
+        self._reset_at: float | None = None
         self.steps = steps
         self.width, self.height = width, height
         self.coarse = False
@@ -172,7 +179,16 @@ class TrimAdjuster:
             self.coarse = not self.coarse
             return "step"
         if action == RESET:
-            return self._set(TrimParams())
+            # 한 번: 마지막 저장값으로 (보정 중 실수했을 때 직전 저장 지점으로).
+            # RESET_ZERO_SECONDS 안에 두 번: 0/0/1.0/1.0.
+            now = self._clock()
+            if self._reset_at is not None and now - self._reset_at <= RESET_ZERO_SECONDS:
+                self._reset_at = None
+                print("reset -> zero")
+                return self._set(TrimParams())
+            self._reset_at = now
+            print("reset -> saved")
+            return self._set(self.saved)
         if action == SET and command.value is not None:
             return self._set(command.value)
 
@@ -209,7 +225,7 @@ ARROW_DOWN = (65364, 2621440)
 # 숫자 키패드. 운전석에서 한 손으로 쓰라고 둔 배치다.
 #
 #     7 위폭 좁게    8 위         9 위폭 넓게      / 전체 폭 좁게
-#     4 왼쪽         5 저장+종료  6 오른쪽         * 리셋
+#     4 왼쪽         5 저장+종료  6 오른쪽         * 저장값으로 (두 번: 0)
 #     1 아래폭 좁게  2 아래       3 아래폭 넓게    - 전체 폭 넓게
 #     0 또는 . 큰 폭/작은 폭       Enter, + 저장
 #
@@ -421,13 +437,13 @@ def run_trim(args: argparse.Namespace) -> None:
     print("arrows move, w/s top width, z/x bottom width, f or tab coarse/fine,")
     print("enter save, q quit")
     print("keypad: 8/2/4/6 move, 7/9 top width, 1/3 bottom width, / - both,")
-    print("        * reset, 0 or . step, enter or + save, 5 save and quit")
+    print("        * reset to saved (twice: zero), 0 or . step, enter or + save, 5 save and quit")
     print(_describe(adjuster))
 
     mirror = mapper.physical_flip_horizontal
     help_lines = [
         "arrows move  w/s top  z/x bottom  f step  enter save  q quit",
-        "keypad  7 top-     8 up    9 top+       / both-   * reset",
+        "keypad  7 top-     8 up    9 top+       / both-   * saved (x2 zero)",
         "        4 left     5 done  6 right      - both+   0/. step",
         "        1 bottom-  2 down  3 bottom+    enter/+ save  (5 done = save+quit)",
     ]

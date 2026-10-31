@@ -1304,7 +1304,7 @@ def run_receive(args: argparse.Namespace) -> None:
     trim = _ReceiveTrim(config, args.config, renderer)
     fade = _ReceiveFadePresets(renderer)
     print("keypad trim: 8/2/4/6 move, 7/9 top width, 1/3 bottom width, / - both, 0/f/tab step, "
-          "* reset, 5/enter/+ save. [ ] fade preset. q/esc quit")
+          "* reset to saved (twice: zero), 5/enter/+ save. [ ] fade preset. q/esc quit")
 
     try:
         while True:
