@@ -37,7 +37,8 @@
       "fit_points": 8,
       "fit_degree": 1,
       "max_rms": 0.02,
-      "max_extend": 0.3
+      "max_extend": 0.3,
+      "near_anchor": 0.85
     },
     "edge_stops": [
       [

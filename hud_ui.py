@@ -968,14 +968,15 @@ class LaneFeed:
         packet["lanes"] = self.smoother.update(packet["lanes"], packet.get("lane_ids"))
         # 외삽은 스무딩 뒤에 한다. 스무딩은 슬롯별 필터라 점 개수가 흔들리면
         # 안 되고, 외삽은 그리기 직전 정규화 공간에서 해야 정렬·trim 과 무관하다.
-        # 2차식 계수로 온 패킷은 이미 y_range 로 폈으므로 건드리지 않는다.
-        if not packet.get("lanes_from_poly"):
-            raw_state = normalize_state(packet.get("state", STATE_NORMAL))
-            if packet["status"] == "lost":
-                raw_state = STATE_LOST
-            packet["lanes"] = extend_lanes(
-                packet["lanes"], self.lane_extend, state=raw_state
-            )
+        # 2차식 계수로 온 패킷은 이미 y_range 로 폈으므로 near_anchor 맞추기만
+        # 한다 (본넷에 y_range 가 잘리는 건 똑같다). near_anchor 가 0 이면 그대로.
+        raw_state = normalize_state(packet.get("state", STATE_NORMAL))
+        if packet["status"] == "lost":
+            raw_state = STATE_LOST
+        packet["lanes"] = extend_lanes(
+            packet["lanes"], self.lane_extend, state=raw_state,
+            anchor_only=bool(packet.get("lanes_from_poly")),
+        )
         self.latest = packet
         self.latest_received = time.monotonic()
         self.last_sequence = packet["seq"]
@@ -1298,7 +1299,8 @@ def run_bench(args: argparse.Namespace) -> None:
     extend_ms = (time.perf_counter() - start) / args.frames * 1000.0
     points = "+".join(str(len(lane)) for lane in extended)
     print(f"lane_extend {'on ' if extend['enabled'] else 'off'} "
-          f"{extend_ms:6.3f} ms/packet   points {points}")
+          f"{extend_ms:6.3f} ms/packet   points {points}"
+          f"   near_anchor {extend['near_anchor']:.2f}")
     lanes = extended
     telemetry = {"confidence": 0.7, "fps": 22.4, "inference_ms": 44.6,
                  "departure_distance": 0.3}

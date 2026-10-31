@@ -294,6 +294,13 @@ def _select_hud_lanes(
 #     (소실점을 넘어 두 선이 교차하는 경우가 있었다).
 #   한쪽 끝에서 늘리는 y 거리는 min(관측 길이 × 0.6, max_extend) 로 막는다.
 #     검출이 짧을 때 화면 절반을 지어내지 않게.
+#   near_anchor (0 이면 끔): 가까운 쪽 끝을 항상 이 y 에 맞춘다. 켜면 near_to 는
+#     무시한다. 가속할 때 본넷이 올라와 검출이 위에서 끝나면 선 끝이 따라
+#     올라가 "차선이 들린" 것처럼 보였다. 끝점이 한 자리에 있어야 한다.
+#       끝이 위에 있으면  near_anchor 까지 늘린다 (위 1차 외삽, max_extend 상한
+#                         그대로. 상한에 걸리면 닿는 데까지만)
+#       끝이 아래 있으면  near_anchor 아래 점을 버리고 그 y 의 점을 보간해 끝으로 둔다
+#     2차식 경로도 y_range 가 본넷에 잘리는 건 같으므로 이 단계만 적용한다.
 # 2차식(left/right 계수) 폴백 경로는 이미 y_range 로 펴서 오므로 대상이 아니다.
 # ---------------------------------------------------------------------------
 
@@ -306,6 +313,7 @@ LANE_EXTEND_DEFAULTS: dict[str, Any] = {
     "fit_degree": 1,
     "max_rms": 0.02,
     "max_extend": 0.30,
+    "near_anchor": 0.0,
 }
 # 생성한 점의 x 가 이 범위를 벗어나면 거기서 멈춘다
 LANE_EXTEND_X_LIMITS = (-0.5, 1.5)
@@ -322,7 +330,7 @@ def lane_extend_settings(config: dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw, dict):
         settings.update(raw)
     settings["enabled"] = bool(settings["enabled"])
-    for key in ("near_to", "far_ratio", "max_rms", "max_extend"):
+    for key in ("near_to", "far_ratio", "max_rms", "max_extend", "near_anchor"):
         settings[key] = float(settings[key])
     settings["fit_degree"] = 2 if int(settings["fit_degree"]) >= 2 else 1
     # 점이 fit_points 보다 적으면 있는 만큼 쓴다. 다만 LANE_EXTEND_MIN_FIT 미만은 안 늘린다
@@ -332,11 +340,19 @@ def lane_extend_settings(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _extend_end(
-    fit_y: Any, fit_x: Any, target_y: float, max_rms: float, degree: int
+    fit_y: Any,
+    fit_x: Any,
+    target_y: float,
+    max_rms: float,
+    degree: int,
+    *,
+    exact: bool = False,
 ) -> list[list[float]]:
     """끝 점들(fit_y 의 마지막이 끝 점)로 x = f(y) 를 degree 차로 맞춰 target_y 까지 편다.
 
     잔차 RMS 는 맞춘 차수 기준이다(1차면 직선 잔차).
+    exact 면 남은 거리가 점 간격의 절반보다 짧아도 target_y 에 점 하나를 찍는다
+    (near_anchor 는 끝이 정확히 그 y 에 와야 한다).
 
     돌려주는 점은 끝 점에서 바깥쪽 순서다. 끝 점 자체는 넣지 않는다.
     """
@@ -346,7 +362,9 @@ def _extend_end(
     span = target_y - end_y
     gaps = np.abs(np.diff(fit_y))
     step = float(np.median(gaps)) if gaps.size else 0.0
-    if step <= 1e-6 or abs(span) < step * 0.5:
+    if step <= 1e-6 or abs(span) <= 1e-6:
+        return []
+    if not exact and abs(span) < step * 0.5:
         return []
     # 끝 점 기준으로 y 를 옮겨 맞춘다. 0~1 원좌표 그대로보다 조건수가 좋다.
     rel_y = fit_y - end_y
@@ -370,11 +388,35 @@ def _extend_end(
     return output
 
 
-def extend_lane(lane: list[list[float]], settings: dict[str, Any]) -> list[list[float]]:
-    """정규화 폴리라인 하나의 양끝을 늘린다. y 는 먼 쪽 -> 가까운 쪽 오름차순."""
+def _cut_near(points: Any, anchor: float) -> list[list[float]]:
+    """y 오름차순 점들에서 anchor 보다 아래(y 큰 쪽) 점을 버리고 anchor 위치 점을 끝에 둔다."""
+    keep = int((points[:, 1] <= anchor).sum())
+    output = [[float(x), float(y)] for x, y in points[:keep]]
+    if keep == 0:
+        # 선 전체가 anchor 아래에 있다. 그릴 구간이 없다.
+        return []
+    if output[-1][1] < anchor:
+        x0, y0 = output[-1]
+        x1, y1 = (float(v) for v in points[keep])
+        ratio = (anchor - y0) / (y1 - y0)
+        output.append([round(x0 + (x1 - x0) * ratio, 5), round(anchor, 5)])
+    return output
+
+
+def extend_lane(
+    lane: list[list[float]],
+    settings: dict[str, Any],
+    *,
+    anchor_only: bool = False,
+) -> list[list[float]]:
+    """정규화 폴리라인 하나의 양끝을 늘린다. y 는 먼 쪽 -> 가까운 쪽 오름차순.
+
+    anchor_only 면 near_anchor 맞추기만 한다 (2차식 경로).
+    """
     import numpy as np
 
-    if len(lane) < settings["min_points"]:
+    anchor = settings["near_anchor"]
+    if (anchor_only and anchor <= 0.0) or len(lane) < 2:
         return lane
     points = np.asarray(lane, dtype=np.float64)
     order = np.argsort(points[:, 1], kind="stable")
@@ -382,8 +424,7 @@ def extend_lane(lane: list[list[float]], settings: dict[str, Any]) -> list[list[
     ys = points[:, 1]
     xs = points[:, 0]
     fit = min(settings["fit_points"], len(points))
-    if fit < LANE_EXTEND_MIN_FIT:
-        return lane
+    can_fit = len(points) >= settings["min_points"] and fit >= LANE_EXTEND_MIN_FIT
     degree = settings["fit_degree"]
     max_rms = settings["max_rms"]
     min_y = float(ys[0])
@@ -391,21 +432,36 @@ def extend_lane(lane: list[list[float]], settings: dict[str, Any]) -> list[list[
     observed = max_y - min_y
     limit = min(observed * LANE_EXTEND_OBSERVED_RATIO, settings["max_extend"])
 
-    # 가까운 쪽: near_to 까지, 단 limit 이내. 끝 점이 마지막이 되도록 정순 그대로 넘긴다.
-    near_to = min(settings["near_to"], max_y + limit)
-    near = _extend_end(ys[-fit:], xs[-fit:], near_to, max_rms, degree)
+    body: list[list[float]] | None = None  # None 이면 원래 점 그대로
+    near: list[list[float]] = []
+    if anchor > 0.0:
+        # near_anchor 가 near_to 보다 우선한다.
+        if max_y > anchor:
+            # 아래로 넘친 점은 버린다. 점 개수와 상관없이 한다.
+            body = _cut_near(points, anchor)
+        elif max_y < anchor and can_fit:
+            # limit 안에서 anchor 까지. 끝 점이 마지막이 되도록 정순 그대로 넘긴다.
+            near = _extend_end(
+                ys[-fit:], xs[-fit:], min(anchor, max_y + limit), max_rms, degree,
+                exact=True,
+            )
+    elif can_fit:
+        # 가까운 쪽: near_to 까지, 단 limit 이내.
+        near_to = min(settings["near_to"], max_y + limit)
+        near = _extend_end(ys[-fit:], xs[-fit:], near_to, max_rms, degree)
 
     # 먼 쪽: 관측 길이의 far_ratio 만큼(limit 이내). 0 이면 건너뛴다.
-    # 이미지 위(y<0)로는 넘기지 않는다.
+    # 이미지 위(y<0)로는 넘기지 않는다. 2차식 경로는 대상이 아니다.
     far: list[list[float]] = []
-    if settings["far_ratio"] > 0.0:
+    if not anchor_only and can_fit and settings["far_ratio"] > 0.0:
         far_to = max(0.0, min_y - min(settings["far_ratio"] * observed, limit))
         far = _extend_end(ys[:fit][::-1], xs[:fit][::-1], far_to, max_rms, degree)
 
-    if not near and not far:
-        return lane
-    original = [[float(x), float(y)] for x, y in points]
-    return far[::-1] + original + near
+    if body is None:
+        if not near and not far:
+            return lane
+        body = [[float(x), float(y)] for x, y in points]
+    return far[::-1] + body + near
 
 
 def extend_lanes(
@@ -413,11 +469,21 @@ def extend_lanes(
     settings: dict[str, Any],
     *,
     state: int = 0,
+    anchor_only: bool = False,
 ) -> list[list[list[float]]]:
-    """lanes 패킷의 차선들을 늘린다. 꺼져 있거나 state 2 면 그대로 돌려준다."""
+    """lanes 패킷의 차선들을 늘린다. 꺼져 있거나 state 2 면 그대로 돌려준다.
+
+    anchor_only 는 2차식으로 편 선용이다. near_anchor 맞추기만 한다.
+    near_anchor 로 잘라서 점이 2개 미만이 된 선은 뺀다.
+    """
     if not settings["enabled"] or not lanes or state == 2:
         return lanes
-    return [extend_lane(lane, settings) for lane in lanes]
+    if anchor_only and settings["near_anchor"] <= 0.0:
+        return lanes
+    extended = [extend_lane(lane, settings, anchor_only=anchor_only) for lane in lanes]
+    if settings["near_anchor"] > 0.0:
+        extended = [lane for lane in extended if len(lane) >= 2]
+    return extended
 
 
 class HudSender:
