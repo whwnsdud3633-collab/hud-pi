@@ -67,10 +67,10 @@
     "profiles": [],
     "blend": 0.0,
     "trim": {
-      "dx_px": 39.5,
-      "dy_px": -255.4,
-      "top_scale": 0.65,
-      "bottom_scale": 1.29
+      "dx_px": 93.0,
+      "dy_px": -402.0,
+      "top_scale": 1.0,
+      "bottom_scale": 1.0
     },
     "trim_step": {
       "fine": {
