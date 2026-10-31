@@ -643,7 +643,20 @@ def _adapt_jetson_packet(packet: dict[str, Any]) -> None:
                 break
 
 
-def _decode_packet(payload: bytes) -> dict[str, Any]:
+def _drop_lanes_for_poly(packet: dict[str, Any]) -> None:
+    """display.ignore_lanes 용. lanes / lane_ids 를 떨어뜨려 2차식 경로로 보낸다.
+
+    젯슨이 lanes 를 같이 보내도 예전처럼 left/right 계수를 펴서 그리게 한다.
+    A/B 비교와 발표 중 즉시 되돌리기용. left/right 가 아예 없는 패킷(mock,
+    예전 송신기)은 떨어뜨리면 그릴 게 없어지므로 그대로 둔다.
+    """
+    if "left" not in packet and "right" not in packet:
+        return
+    packet.pop("lanes", None)
+    packet.pop("lane_ids", None)
+
+
+def _decode_packet(payload: bytes, *, ignore_lanes: bool = False) -> dict[str, Any]:
     if len(payload) > MAX_DATAGRAM_BYTES:
         raise PacketError("packet exceeds size limit")
     try:
@@ -654,6 +667,9 @@ def _decode_packet(payload: bytes) -> dict[str, Any]:
         raise PacketError("packet must be an object")
     if packet.get("v", PROTOCOL_VERSION) != PROTOCOL_VERSION:
         raise PacketError("unsupported protocol version")
+    # 어댑터보다 먼저 해야 _is_jetson_packet 이 2차식 경로로 판정한다.
+    if ignore_lanes:
+        _drop_lanes_for_poly(packet)
     # 파이 내부 표시. 2차식 계수를 펴서 만든 lanes 는 외삽 대상이 아니다.
     packet["lanes_from_poly"] = _is_jetson_packet(packet)
     if packet["lanes_from_poly"]:
@@ -703,13 +719,18 @@ def open_receiver(
 
 
 def receive_latest(
-    receiver: socket.socket, timeout: float, last_sequence: int
+    receiver: socket.socket,
+    timeout: float,
+    last_sequence: int,
+    *,
+    ignore_lanes: bool = False,
 ) -> tuple[dict[str, Any] | None, int, int, Any]:
     """쌓인 패킷을 전부 꺼내 가장 최근 것 하나만 돌려준다.
 
     한 번에 하나씩 꺼내면 렌더가 송신보다 느린 순간마다 커널 버퍼에 패킷이
     쌓이고, 화면은 그만큼 옛날 차선을 계속 그린다.
     seq 가 last_sequence 보다 작은 패킷(역전)은 쓰지 않는다.
+    ignore_lanes 가 참이면 lanes 를 버리고 2차식 계수로 그린다 (_decode_packet).
 
     반환: (패킷 또는 None, 안 쓰고 버린 정상 패킷 수, 깨진 패킷 수,
     마지막 깨진 패킷의 송신 주소)
@@ -727,7 +748,7 @@ def receive_latest(
         except BlockingIOError:
             break
         try:
-            packet = _decode_packet(payload)
+            packet = _decode_packet(payload, ignore_lanes=ignore_lanes)
         except (PacketError, ValueError, TypeError):
             invalid += 1
             invalid_address = address
@@ -915,6 +936,7 @@ def run_receiver(args: argparse.Namespace) -> None:
         port,
         int(network.get("recv_buffer_bytes", DEFAULT_RECV_BUFFER_BYTES)),
     )
+    ignore_lanes = bool(display.get("ignore_lanes", False))
 
     window_name = str(display["window_name"])
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -931,7 +953,9 @@ def run_receiver(args: argparse.Namespace) -> None:
 
     try:
         while True:
-            packet, _, invalid, address = receive_latest(receiver, 0.01, last_sequence)
+            packet, _, invalid, address = receive_latest(
+                receiver, 0.01, last_sequence, ignore_lanes=ignore_lanes
+            )
             for _ in range(invalid):
                 invalid_packets += 1
                 if invalid_packets % 30 == 1:

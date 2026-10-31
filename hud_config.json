@@ -24,6 +24,7 @@
     "flip_horizontal": false,
     "flip_vertical": true,
     "show_status": false,
+    "ignore_lanes": false,
     "smoothing_alpha": 1.0,
     "association_distance": 0.18,
     "jump_gate_distance": 0.0,

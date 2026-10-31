@@ -924,6 +924,9 @@ class LaneFeed:
         )
         # lanes 폴리라인 양끝 외삽. 끄면(enabled false) 예전과 똑같이 그린다.
         self.lane_extend = lane_extend_settings(config)
+        # 참이면 젯슨이 lanes 를 보내도 버리고 left/right 2차식 계수로 그린다.
+        # A/B 비교, 발표 중 예전 방식으로 즉시 되돌리기용. 키가 없으면 거짓.
+        self.ignore_lanes = bool(display.get("ignore_lanes", False))
         # 무수신 판정과 state 디바운싱은 전부 여기에 있다. 이 루프는 판정을
         # 하지 않고 결과만 받아 그린다.
         self.tracker = StateTracker(config)
@@ -953,7 +956,7 @@ class LaneFeed:
     def poll(self, timeout: float) -> None:
         """쌓인 패킷을 전부 꺼내 가장 최근 것만 쓴다. 없으면 timeout 만큼 기다린다."""
         packet, skipped, invalid, address = receive_latest(
-            self.socket, timeout, self.last_sequence
+            self.socket, timeout, self.last_sequence, ignore_lanes=self.ignore_lanes
         )
         self.skipped += skipped
         for _ in range(invalid):
