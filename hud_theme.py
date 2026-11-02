@@ -34,7 +34,7 @@ import cv2
 import numpy as np
 
 from hud_align import AlignmentMap, ensure_alignment_config
-from hud_system import _clip_polyline
+from hud_system import _clip_polyline, _lane_degree_text
 
 DESIGN_W, DESIGN_H = 960.0, 540.0
 HORIZON_Y = 172.0
@@ -343,8 +343,8 @@ class ThemeRenderer:
     ) -> tuple[np.ndarray | None, np.ndarray | None]:
         """좌우 차선이 원거리에서 붙거나 교차하는 끝을 잘라 낸다.
 
-        젯슨은 두 차선을 따로 2차 피팅하고 y 구간 하나를 같이 보낸다. 그래서
-        소실점 부근에서 두 포물선이 몇 픽셀씩 겹쳐 X 자로 교차한다. 실측
+        젯슨은 두 차선을 따로 피팅하고 y 구간 하나를 같이 보낸다. 그래서
+        소실점 부근에서 두 곡선이 몇 픽셀씩 겹쳐 X 자로 교차한다. 실측
         캡처에서 교차는 전부 y_range 맨 위 끝에서만 났다. 와이어 포맷은 그대로
         두고 그리는 쪽에서 정리한다.
 
@@ -556,10 +556,11 @@ class ThemeRenderer:
                 # 수신 지연. 젯슨 ts 대비 LAG, 최솟값 대비 Q, 버린 패킷 수
                 lag = debug.get("lag_ms")
                 queue = debug.get("queue_ms")
-                lines.append("LAG {}  Q {}  SKIP {}  BAD {}".format(
+                lines.append("LAG {}  Q {}  SKIP {}  BAD {}  {}".format(
                     "--" if lag is None else f"{lag:.0f}ms",
                     "--" if queue is None else f"{queue:.0f}ms",
-                    debug.get("skipped", 0), debug.get("dropped", 0)))
+                    debug.get("skipped", 0), debug.get("dropped", 0),
+                    _lane_degree_text(debug.get("lane_degrees"))))
             # 차선의 패널 y 범위 (위 / 아래). 0 ~ H-1 밖이면 화면에서 잘린다
             yinfo = self.lane_y_debug
 

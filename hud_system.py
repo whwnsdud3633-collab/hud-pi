@@ -359,7 +359,7 @@ class HudSender:
 # 젯슨 실제 송신 포맷 어댑터 -------------------------------------------------
 #
 # 젯슨은 lanes 배열이 아니라 left/right 를 따로, 그것도 점 배열이 아니라
-# 2차 다항식 계수로 보낸다. 실측 패킷(2026-09-12, 192.168.50.10)에서 확인:
+# 다항식 계수로 보낸다. 실측 패킷(2026-09-12, 192.168.50.10)에서 확인:
 #
 #   {"v":1,"seq":292,"ts":1789149939.25,"img_w":960,"img_h":540,
 #    "state":0,"conf":1.0,
@@ -372,9 +372,20 @@ class HudSender:
 # y 의 유효 구간이 y_range = [y_top, y_bottom] 이다. 위 패킷을 풀면
 # left 는 y=216 에서 x=385, y=410 에서 x=100, right 는 같은 구간에서
 # x=397 -> x=562 로 소실점에서 수렴하고 아래에서 벌어진다.
+#
+# 젯슨과 합의한 3차 규격: 계수가 4개면 [a, b, c, d] 이고
+# x = a*y^3 + b*y^2 + c*y + d 다 (높은 차수부터, np.polyfit 순서). 단위와
+# y_range 는 2차와 같고, 한 패킷에서 선마다 차수가 달라도 된다.
 
-# 계수를 몇 점으로 펴서 보낼지. CLAUDE.md 의 "점 개수 12개 고정" 을 따른다.
+# 계수를 몇 점으로 펴서 보낼지. 2차는 CLAUDE.md 의 "점 개수 12개 고정" 을 따른다.
 JETSON_LANE_SAMPLES = 12
+# 3차는 S자 모양을 담으려면 점이 더 필요하다.
+JETSON_LANE_SAMPLES_CUBIC = 20
+# 받아 주는 계수 개수와 그때 펼 점 개수.
+JETSON_SAMPLES_BY_COEFFICIENTS = {
+    3: JETSON_LANE_SAMPLES,
+    4: JETSON_LANE_SAMPLES_CUBIC,
+}
 
 # status 필드가 없어서 state 로 유추한다.
 JETSON_STATE_STATUS = {0: "ok", 1: "degraded", 2: "lost"}
@@ -404,11 +415,17 @@ def _poly_lane_to_normalized(
     *,
     img_w: float,
     img_h: float,
-    samples: int = JETSON_LANE_SAMPLES,
+    samples: int | None = None,
 ) -> list[list[float]]:
-    """2차 계수 + y 구간을 0~1 정규화 폴리라인으로 편다."""
-    if not isinstance(coefficients, (list, tuple)) or len(coefficients) != 3:
-        raise PacketError("lane must be 3 polynomial coefficients")
+    """계수(높은 차수부터) + y 구간을 0~1 정규화 폴리라인으로 편다.
+
+    samples 를 안 주면 차수별 기본값을 쓴다.
+    """
+    if (
+        not isinstance(coefficients, (list, tuple))
+        or len(coefficients) not in JETSON_SAMPLES_BY_COEFFICIENTS
+    ):
+        raise PacketError("lane must be 3 or 4 polynomial coefficients")
     if not all(_finite(value) for value in coefficients):
         raise PacketError("lane coefficients must be finite")
     if not isinstance(y_range, (list, tuple)) or len(y_range) != 2:
@@ -416,7 +433,9 @@ def _poly_lane_to_normalized(
     if not all(_finite(value) for value in y_range):
         raise PacketError("y_range must be finite")
 
-    a, b, c = (float(value) for value in coefficients)
+    if samples is None:
+        samples = JETSON_SAMPLES_BY_COEFFICIENTS[len(coefficients)]
+    leading, *rest = (float(value) for value in coefficients)
     y_top, y_bottom = (float(value) for value in y_range)
     if y_bottom < y_top:
         y_top, y_bottom = y_bottom, y_top
@@ -431,9 +450,23 @@ def _poly_lane_to_normalized(
     for index in range(samples):
         progress = index / (samples - 1)
         y = y_top + (y_bottom - y_top) * progress
-        x = (a * y + b) * y + c
+        # 호너법. 계수 3개면 (a * y + b) * y + c 라 2차 결과가 비트까지 같다.
+        # 이 모듈은 numpy 없이 import 되는 파일이라 polyval 을 쓰지 않는다.
+        x = leading
+        for coefficient in rest:
+            x = x * y + coefficient
         points.append([x / width, y / height])
     return points
+
+
+def _lane_degree_text(degrees: dict[str, int] | None) -> str:
+    """디버그 줄에 쓸 선별 차수. 예: "deg L3 R2". 계수 패킷이 아니면 "deg --"."""
+    if degrees is None:
+        return "deg --"
+    text = f"deg L{degrees.get('left', '-')} R{degrees.get('right', '-')}"
+    if "extra" in degrees:
+        text += f" E{degrees['extra']}"
+    return text
 
 
 def _adapt_jetson_packet(packet: dict[str, Any]) -> None:
@@ -448,6 +481,7 @@ def _adapt_jetson_packet(packet: dict[str, Any]) -> None:
     y_range = packet.get("y_range")
     lanes: list[list[list[float]]] = []
     lane_ids: list[Any] = []
+    lane_degrees: dict[str, int] = {}
     for side in ("left", "right"):
         coefficients = packet.get(side)
         if coefficients is None:
@@ -461,11 +495,31 @@ def _adapt_jetson_packet(packet: dict[str, Any]) -> None:
                 img_h=float(img_h),
             )
         )
+        lane_degrees[side] = len(coefficients) - 1
         # 트랙 id 를 차선과 같은 순서로 실어 보낸다. 스무딩이 이걸로 차선
         # 동일성을 판정한다. 없으면 None 자리를 남겨 근접도 폴백으로 간다.
         lane_ids.append(_lane_track_id(packet.get(f"id_{side}")))
     packet["lanes"] = lanes
     packet["lane_ids"] = lane_ids
+
+    # extra 는 규칙만 같게 검사한다. 잘못된 값이어도 extra 만 버리고 패킷은
+    # 살린다. extra 때문에 left/right 까지 꺼지면 안 된다. 아직 그리는 차선이
+    # 아니므로 lanes 에는 넣지 않는다. 넣으면 extra 가 오는 순간 차선 선택
+    # 결과가 달라진다. OverflowError 는 _finite 가 아주 큰 정수에서 낸다.
+    extra = packet.get("extra")
+    if extra is not None:
+        try:
+            _poly_lane_to_normalized(
+                extra,
+                y_range,
+                img_w=float(img_w),
+                img_h=float(img_h),
+            )
+        except (PacketError, OverflowError):
+            pass
+        else:
+            lane_degrees["extra"] = len(extra) - 1
+    packet["lane_degrees"] = lane_degrees
 
     # ts -> sent_at
     if "sent_at" not in packet and _finite(packet.get("ts")):

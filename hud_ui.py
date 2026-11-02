@@ -58,6 +58,7 @@ from hud_state import StateTracker, ensure_state_config
 from hud_system import (
     DEFAULT_RECV_BUFFER_BYTES,
     WARNING_STATES,
+    _lane_degree_text,
     _mock_lane,
     _select_hud_lanes,
     LaneSmoother,
@@ -399,6 +400,7 @@ class HudRenderer:
             _latency_line(info),
             f"STATE {self.state}",
             "ALIGN {align}".format(align="driver-calibrated" if self.mapper.calibrated else "UNCALIBRATED (quad fallback)"),
+            _lane_degree_text(info.get("lane_degrees")),
         ]
         for index, line in enumerate(lines):
             point = self._panel_point(float(origin_x), float(origin_y) + gap * index)
@@ -468,6 +470,7 @@ def _blank_debug(**overrides: Any) -> dict[str, Any]:
         "lag_ms": None,
         "queue_ms": None,
         "warning": "none",
+        "lane_degrees": None,
     }
     info.update(overrides)
     return info
@@ -1033,6 +1036,7 @@ class LaneFeed:
                 lag_ms=self.lag_ms,
                 queue_ms=queue_ms,
                 warning=warning,
+                lane_degrees=latest.get("lane_degrees"),
             )
         # 페이드가 남아 있는 동안은 마지막으로 받은 좌표를 그대로 어둡게
         # 깔아 둔다. 뚝 끊기는 것보다 사라지는 편이 덜 놀랍다.
