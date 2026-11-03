@@ -24,7 +24,7 @@
     "flip_horizontal": false,
     "flip_vertical": true,
     "show_status": false,
-    "smoothing_alpha": 1.0,
+    "smoothing_alpha": 0.7,
     "association_distance": 0.18,
     "jump_gate_distance": 0.0,
     "jump_gate_frames": 3,
@@ -67,10 +67,10 @@
     "profiles": [],
     "blend": 0.0,
     "trim": {
-      "dx_px": 96.0,
-      "dy_px": -279.0,
-      "top_scale": 0.95,
-      "bottom_scale": 1.17
+      "dx_px": -51.0,
+      "dy_px": -360.0,
+      "top_scale": 1.07,
+      "bottom_scale": 1.06
     },
     "trim_step": {
       "fine": {
