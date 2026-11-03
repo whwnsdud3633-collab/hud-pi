@@ -34,6 +34,7 @@ import cv2
 import numpy as np
 
 from hud_align import AlignmentMap, ensure_alignment_config
+from hud_radar import DistanceOverlay
 from hud_system import _clip_polyline, _lane_degree_text
 
 DESIGN_W, DESIGN_H = 960.0, 540.0
@@ -168,6 +169,11 @@ class ThemeRenderer:
         self.lane_state = STATE_NORMAL
         self.lane_opacity = 1.0
         self._build_state_bar()
+        self.radar = DistanceOverlay(
+            config, self.width, self.height,
+            flip_vertical=self.mapper.physical_flip_vertical,
+            flip_horizontal=self.mapper.physical_flip_horizontal,
+        )
 
     def _update_ramps(self, near: float, far: float) -> None:
         """원근 페이드를 리본이 실제로 차지한 세로 범위에 맞춘다.
@@ -545,6 +551,9 @@ class ThemeRenderer:
         else:
             self.lane_y_debug = {}
         self._draw_state_bar()
+        # 레이더 전방 거리. 차선이 없는 state 2 에서만. 띄울지는 LaneFeed 가 정한다
+        if self.state == STATE_LOST:
+            self.radar.draw(self.planes, telemetry.get("radar_m"))
 
         frame = self._compose()
         if debug is not None and debug.get("show"):

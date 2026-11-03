@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
+from hud_radar import read_radar
+
 
 PROTOCOL_VERSION = 1
 MAX_DATAGRAM_BYTES = 60_000
@@ -591,6 +593,8 @@ def _decode_packet(payload: bytes) -> dict[str, Any]:
     packet["lane_change"] = lane_change
     packet["fps"] = float(packet.get("fps", 0.0))
     packet["inference_ms"] = float(packet.get("inference_ms", 0.0))
+    # 레이더 전방 거리 (dist_on / dist_m). 없거나 잘못되면 None, 패킷은 그대로 쓴다
+    packet["radar_m"] = read_radar(packet)
     return packet
 
 

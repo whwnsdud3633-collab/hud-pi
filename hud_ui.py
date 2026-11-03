@@ -55,6 +55,7 @@ from hud_trim import (
 )
 # 무수신 판정, 페이드, 디바운싱은 그리기 코드가 아니라 상태 계층이 맡는다
 from hud_state import StateTracker, ensure_state_config
+from hud_radar import radar_settings
 from hud_system import (
     DEFAULT_RECV_BUFFER_BYTES,
     WARNING_STATES,
@@ -926,6 +927,8 @@ class LaneFeed:
         # 무수신 판정과 state 디바운싱은 전부 여기에 있다. 이 루프는 판정을
         # 하지 않고 결과만 받아 그린다.
         self.tracker = StateTracker(config)
+        # 레이더 전방 거리. 판정은 여기서 하고 렌더러는 받은 값만 그린다
+        self.radar = radar_settings(config)
 
         network = config.get("network", {})
         self.socket = open_receiver(
@@ -1024,6 +1027,16 @@ class LaneFeed:
                 "fps": latest["fps"],
                 "inference_ms": latest["inference_ms"],
             }
+            # 레이더 거리는 화면 state 가 2 이고 패킷이 살아 있을 때만.
+            # 무수신이면 이 블록에 들어오지 않으므로 숫자도 같이 사라진다.
+            radar_m = latest.get("radar_m")
+            if (
+                self.radar["enabled"]
+                and radar_m is not None
+                and status.state == STATE_LOST
+                and age <= float(self.radar["max_age_s"])
+            ):
+                telemetry["radar_m"] = float(radar_m)
             info = _blank_debug(
                 status=latest["status"],
                 lanes=len(latest["lanes"]),
@@ -1221,6 +1234,8 @@ class _ReceiveFadePresets:
 def run_receive(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     ensure_ui_config(config)
+    if getattr(args, "no_radar", False):
+        config.setdefault("radar", {})["enabled"] = False
     renderer = make_renderer(config, getattr(args, "theme", False))
     display = config["display"]
     network = config["network"]
@@ -1232,6 +1247,7 @@ def run_receive(args: argparse.Namespace) -> None:
     name = str(display["window_name"])
     _open_window(name, renderer, args.windowed, bool(display["fullscreen"]))
     print(f"HUD listening on {bind_host}:{port} / {renderer.width}x{renderer.height}")
+    print("radar distance: " + ("on" if feed.radar["enabled"] else "off (--no-radar or radar.enabled false)"))
 
     started = time.monotonic()
     stats = _LatencyStats(feed) if args.stats else None
@@ -1342,6 +1358,8 @@ def build_parser() -> argparse.ArgumentParser:
     receive.add_argument("--theme", action="store_true", help="AR 오버레이 시안으로")
     receive.add_argument("--stats", action="store_true",
                          help="2초마다 지연(젯슨 ts 기준)과 버린 패킷 수를 출력")
+    receive.add_argument("--no-radar", action="store_true",
+                         help="레이더 전방 거리 표시를 끈다 (설정 radar.enabled 보다 우선)")
 
     bench = subparsers.add_parser("bench", help="이 장치에서 렌더 속도 측정")
     bench.add_argument("--config", type=Path, default=Path("hud_config.json"))

@@ -201,6 +201,7 @@ points[:, 1] += trim_dy * (1.0 - D_VI / depths)
 | `id_left` / `id_right` | 차선 트랙 id |
 | `event` / `intent` | 문자열. 어휘 미확인 (실측 시 둘 다 `""`) |
 | `extra` | 실측은 `null`. 계수가 오면 `left`/`right` 와 같은 규칙으로 검사하되, 잘못된 값이면 `extra` 만 버리고 패킷은 살린다. 아직 그리지 않는다 |
+| `dist_on` / `dist_m` | 레이더 전방 거리 (2026-11-03 추가). 거리가 없으면 키 자체가 없다. `dist_on` 이 정확히 `true` 이고 `dist_m` 이 0 초과 250 이하 숫자일 때만 쓴다. 잘못된 값이어도 패킷은 살린다. **화면 state 2 에서만** 화면 가운데에 "전방 N m" 로 띄운다 (`hud_radar.py`). 끄기: `receive --no-radar` 또는 `radar.enabled: false` |
 
 계수를 풀면 이런 값이 나온다. 위에서 소실점으로 수렴하고 아래에서 벌어진다:
 
